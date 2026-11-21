@@ -63,6 +63,12 @@ DUEL = {
     "drop_range": 220.0,
     "drop_quiet_s": 6.0,
     "drop_clear_m": 100.0,
+    # shoot only mechs that are after us: hit us lately, close, closing in, or nearly dead
+    "only_hunters": True,
+    "hunt_recent_s": 10.0,
+    "hunt_close_m": 60.0,
+    "hunt_closing_mps": 3.0,
+    "hunt_low_frac": 0.3,
 }
 
 PARAMS = DUEL  # simulator overrides ("bot+key=value") land here
@@ -136,6 +142,18 @@ class Duelist(base.Bot):
                 self.pseudo.append((x + dd * math.cos(b), y + dd * math.sin(b), 0.6, t))
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
+
+    def is_hunting(self, m, x, y, dm, frac, t) -> bool:
+        """Is this mech after us? (attacked us lately, already our target, close, closing in, or weak)"""
+        mid = int(m["id"])
+        if t - self.attackers.get(mid, -99) < DUEL["hunt_recent_s"] or (mid == self.tgt_id and t - self.tgt_t < 3.0):
+            return True
+        if dm < DUEL["hunt_close_m"] or frac < DUEL["hunt_low_frac"]:
+            return True
+        v = m.get("vel") or [0.0, 0.0, 0.0]
+        d = max(1.0, hyp(x, y, m["pos"][0], m["pos"][1]))
+        closing = (v[0] * (x - m["pos"][0]) + v[1] * (y - m["pos"][1])) / d
+        return closing > DUEL["hunt_closing_mps"]
 
     def farm_seek(self, obs, x, y, z) -> Optional[Tuple[float, float]]:
         """Walk toward the nearest seen drone (2 cubes) or crate (1 cube) in the safe zone, stopping
@@ -245,6 +263,8 @@ class Duelist(base.Bot):
                 continue
             mid = int(m["id"])
             frac = (m.get("hp") or 1400.0) / max(1.0, m.get("max_hp") or 1400.0)
+            if DUEL["only_hunters"] and not self.is_hunting(m, x, y, dm, frac, t):
+                continue  # a house bot we damage joins the hunt: leave the ones not after us alone
             friends = sum(1 for o in enemies if o is not m and hyp(o["pos"][0], o["pos"][1], mx, my_) < 40)
             cost = dm + 120.0 * frac + 25.0 * friends
             if t - self.attackers.get(mid, -99) < 3.0:
