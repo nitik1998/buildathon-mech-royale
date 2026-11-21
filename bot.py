@@ -42,6 +42,8 @@ base.PARAMS["ffa_ev_needed"] = 3
 # free-for-all economy (base bot): farm unless a mech is this close; defaults keep the old behaviour
 base.PARAMS.update({"ffa_hostile_m": 150.0, "ffa_hide_m": 150.0, "ffa_farm_fast": True})
 base.PARAMS.update({"ffa_zone_depth": 0.0, "ffa_rotate_early": False, "ffa_zone_lead_s": 15.0})
+base.PARAMS.update({"ffa_home": True, "ffa_drops": False, "ffa_cube_cap": 10})
+base.PARAMS.update({"cover_budget_s": 0.02, "astar_nodes": 2500, "astar_budget_s": 0.025})
 FARM_STAND_DRONE = 55.0   # m: outside the drone's 45 m aggro range, close enough for accurate fire
 FARM_STAND_CRATE = 12.0
 
@@ -100,6 +102,29 @@ DUEL = {
     "finish_in": True,
     # free-for-all switch: one mech death we did not cause (and were not shooting at) before this time
     "ffa_death": True,
+    "step_move": False,
+    "step_m": 6.0,
+    "step_watch": 30.0,
+    "step_band_m": 60.0,
+    "hpw_abs": 0.0,
+    "low_bonus": 0.0,
+    "lethal_k": 0.95,
+    "hunt_aim_m": 0.0,
+    "hunt_closing_max_m": 1e9,
+    "hunt_low_m": 1e9,
+    "cube_cap": 0,
+    "drop_push": False,
+    "drop_push_hp": 0.8,
+    "drop_push_m": 260.0,
+    "drop_push_early_s": 6.0,
+    "stick_bonus": 40.0,
+    "finish_me": 0.2,
+    "farm_seen": False,
+    "farm_seen_hp": 0.85,
+    "spawn_sweep": False,
+    "no_fire_after": 0.0,
+    "hop_scan": False,
+    "hop_s": 2.3,
     "open_cautious": False,
     # narrower opening: only "never fire first at range" until squad_t; farming and arming as usual
     "open_noshoot": False,
@@ -157,6 +182,11 @@ class Duelist(base.Bot):
         self.alive0: Optional[int] = None
         self.foreign_since: Optional[float] = None
         self.my_mech_kills = 0
+        self.sw_until = -1.0
+        self.sw_last = -99.0
+        self.hop_air = False
+        self.hop_until = -1.0
+        self.hop_last = -99.0
         self.opening = False
         self.noshoot = False
         self.lite = False
@@ -280,12 +310,16 @@ class Duelist(base.Bot):
             return True
         if self.opening or self.noshoot or self.lite:
             return False  # match type unknown: never fire first at range
-        if frac < DUEL["hunt_low_frac"]:
+        if frac < DUEL["hunt_low_frac"] and dm < DUEL["hunt_low_m"]:
             return True
         v = m.get("vel") or [0.0, 0.0, 0.0]
         d = max(1.0, hyp(x, y, m["pos"][0], m["pos"][1]))
         closing = (v[0] * (x - m["pos"][0]) + v[1] * (y - m["pos"][1])) / d
-        return closing > DUEL["hunt_closing_mps"]
+        if closing > DUEL["hunt_closing_mps"] and dm < DUEL["hunt_closing_max_m"]:
+            return True
+        if DUEL["hunt_aim_m"] > 0 and dm < DUEL["hunt_aim_m"] and m.get("aim"):
+            return abs(wrap(math.atan2(y - m["pos"][1], x - m["pos"][0]) - m["aim"][0])) < 0.25
+        return False
 
     def explore_goal(self, obs, x, y, t, me_id) -> Optional[Tuple[float, float]]:
         """Nothing to do: walk to the least-visited reachable spot 90-160 m away that stays inside the next
@@ -369,6 +403,68 @@ class Duelist(base.Bot):
             if any(hyp(kx, ky, px, py) < DUEL["drop_clear_m"] for kx, ky in known):
                 continue
             best, bd = (px, py), dist
+        return best
+
+    def drop_push_goal(self, obs, x, y, t, hpf, cubes) -> Optional[Tuple[float, float, float, float]]:
+        """A supply drop worth fighting our way to: 4 s alone in its 8 m ring gives full HP, full energy and
+        3 cubes. Taken when we are hurt or the cubes still add stats, if we get there about when it lands and
+        the spot stays inside the zone. Returns (x, y, distance, lands_in)."""
+        if hpf >= DUEL["drop_push_hp"] and cubes + 3 > 10:
+            return None
+        best, bd = None, DUEL["drop_push_m"]
+        for d in obs.get("drops") or []:
+            try:
+                px, py = d["pos"][0], d["pos"][1]
+            except Exception:
+                continue
+            dist = hyp(x, y, px, py)
+            lands = d.get("lands_in") or 0.0
+            if dist > bd or lands > dist / max(1.0, self.walk) + DUEL["drop_push_early_s"]:
+                continue
+            if self.safe_point(obs, px, py, t + max(lands, 0.0) + 5.0) >= 1:
+                continue
+            best, bd = (px, py, dist, lands), dist
+        return best
+
+    def fight_step(self, obs, x, y, z, target, enemies, pref, t, eye_h, muz_h) -> Optional[List[float]]:
+        """Fight movement as a choice among steps: stand still, or one of 16 headings step_m away. Every
+        walkable step is scored on distance from the preferred range, keeping a line of fire to the target,
+        being out of sight of every other mech within 170 m (fewer guns on us at once), room from walls, the
+        zone, and the current strafe side. Returns a move vector, or None to keep the planned move."""
+        W = self.world
+        if W is None:
+            return None
+        tx, ty, tz = target["pos"]
+        others = [m for m in enemies if m is not target and hyp(x, y, m["pos"][0], m["pos"][1]) < 170.0][:5]
+        b = math.atan2(ty - y, tx - x)
+        sx, sy = -math.sin(b) * self.strafe_sign, math.cos(b) * self.strafe_sign
+        step = DUEL["step_m"]
+        best, bs = None, -1e9
+        for k in range(17):
+            if k == 16:
+                cx, cy, dx, dy, sl = x, y, 0.0, 0.0, 0.0
+            else:
+                a = k * math.pi / 8.0
+                dx, dy = math.cos(a), math.sin(a)
+                cx, cy, sl = x + step * dx, y + step * dy, step
+                if not W.walkable(cx, cy) or not W.line_clear(x, y, cx, cy):
+                    continue
+            cz = W.floor[W.idx(cx, cy)]
+            sc = -1.1 * abs(hyp(cx, cy, tx, ty) - pref) - 0.4 * sl
+            sc += 45.0 if not W.sight_blocked((cx, cy, cz + muz_h), (tx, ty, tz + 4.0)) else -45.0
+            for m in others:
+                eye = (m["pos"][0], m["pos"][1], m["pos"][2] + eye_h)
+                if not (W.sight_blocked(eye, (cx, cy, cz + 4.5)) and W.sight_blocked(eye, (cx, cy, cz + 8.5))):
+                    sc -= DUEL["step_watch"]
+            sc -= 2.0 * self.safe_point(obs, cx, cy, t)
+            sc -= 4.0 * sum(1 for (ox, oy) in ((3.5, 0.0), (-3.5, 0.0), (0.0, 3.5), (0.0, -3.5))
+                            if not W.walkable(cx + ox, cy + oy))
+            if k == 16:
+                sc -= 8.0
+            else:
+                sc += 9.0 * (dx * sx + dy * sy)
+            if sc > bs:
+                bs, best = sc, [dx, dy]
         return best
 
     def dodge_bullets(self, obs, me, x, y, z, vx, vy, mv, slow: float) -> Optional[List[float]]:
@@ -519,6 +615,9 @@ class Duelist(base.Bot):
             order = UPGRADES
             if DUEL["upgrade_mode"] == "nanites_first":
                 order = ["nanites", "plating", "armor"] + [u for u in UPGRADES if u not in ("nanites", "plating", "armor")]
+            elif DUEL["upgrade_mode"] == "laser_first":
+                first = ["plating", "armor", "laser_damage", "laser_charge", "nanites", "gun_damage", "gun_rate"]
+                order = first + [u for u in UPGRADES if u not in first]
             elif DUEL["upgrade_mode"] == "damage_first":
                 order = ["laser_damage", "gun_damage", "plating", "laser_charge", "gun_rate", "armor", "nanites"] + \
                     [u for u in UPGRADES if u not in ("laser_damage", "gun_damage", "plating", "laser_charge", "gun_rate", "armor", "nanites")]
@@ -528,6 +627,10 @@ class Duelist(base.Bot):
         weapons = me.get("weapons") or [None, None]
         kinds = [w.get("kind") for w in weapons if w]
         my_id = me.get("id")
+        at_cap = DUEL["cube_cap"] > 0 and (me.get("cubes", 0) or 0) >= DUEL["cube_cap"]
+        armed_now = any(k in ("laser", "lightning") for k in kinds)
+        if at_cap and armed_now:
+            self.corpse = None  # nothing left to loot there
         enemies = [m for m in obs.get("mechs") or []
                    if m.get("kind") == "mech" and m.get("id") != my_id and m.get("id") not in self.dead]
         npcs = [m for m in obs.get("mechs") or [] if m.get("kind") == "npc"]
@@ -579,11 +682,14 @@ class Duelist(base.Bot):
                 if mid == self.tgt_id and t - self.tgt_t < 2.0:
                     cost *= 0.7
             else:
-                cost = dm + 120.0 * frac + 25.0 * friends
+                cost = dm + (DUEL["hpw_abs"] * (m.get("hp") or 1400.0) if DUEL["hpw_abs"] > 0 else 120.0 * frac) \
+                    + 25.0 * friends
+                if frac <= 0.30:
+                    cost -= DUEL["low_bonus"]
                 if t - self.attackers.get(mid, -99) < 3.0:
                     cost -= 50.0
                 if mid == self.tgt_id and t - self.tgt_t < 2.0:
-                    cost -= 40.0
+                    cost -= DUEL["stick_bonus"]
             if cost < best:
                 best, target = cost, m
         if DUEL["multi_focus"] and n_threat >= 2:
@@ -614,7 +720,7 @@ class Duelist(base.Bot):
             retreat = True
         elif hpf < DUEL["retreat_hp_1"] and (tfrac is None or hpf < tfrac + 0.1):
             retreat = True
-        finishing = target is not None and tfrac is not None and tfrac < DUEL["finish_frac"] and hpf > 0.2 \
+        finishing = target is not None and tfrac is not None and tfrac < DUEL["finish_frac"] and hpf > DUEL["finish_me"] \
             and n_threat <= 2
         if finishing:
             retreat = False
@@ -658,9 +764,18 @@ class Duelist(base.Bot):
         boost = False
         hold = False          # fighting in place: strafe only
         mode = "travel"
+        dpg = self.drop_push_goal(obs, x, y, t, hpf, me.get("cubes", 0) or 0) if DUEL["drop_push"] else None
         if zone_urgent and (out_now or zdist > 8):
             goal, mode = (zgx, zgy), "zone"
             boost = out_now and energy > 20
+        elif dpg is not None and (not retreat or dpg[2] < 150.0):
+            if dpg[2] > 3.5:
+                goal, mode = (dpg[0], dpg[1]), "drop-push"
+                boost = energy > 35 and dpg[2] > 25 and (hpf < 0.7 or dpg[3] < 3.0)
+            else:
+                # inside the ring: circle close to its centre (leaving the ring restarts the clock)
+                goal = (dpg[0] + 2.5 * math.cos(1.6 * t), dpg[1] + 2.5 * math.sin(1.6 * t))
+                mode = "drop-hold"
         elif retreat and threats:
             if W and (self.cover is None or t - self.cover_t > 0.5):
                 self.choose_cover(obs, x, y, z, threats, t)
@@ -708,7 +823,7 @@ class Duelist(base.Bot):
             gun_only = not any(k in ("laser", "lightning") for k in kinds)
             wmax = DUEL["fight_weapon_gun_m"] if gun_only else DUEL["fight_weapon_armed_m"]
             fa = self.econ_goal(obs, me, x, y, z, t, act, False, wmax=wmax, weapons_only=True)
-            if fa is None:
+            if fa is None and not at_cap:
                 cr_save = base.PARAMS["cube_range"]
                 base.PARAMS["cube_range"] = DUEL["fight_cube_m"] if hpf > 0.5 else DUEL["fight_cube_hurt_m"]
                 try:
@@ -743,8 +858,14 @@ class Duelist(base.Bot):
                 if dg is not None:
                     econ = (dg, "drop")
                 elif hpf >= 0.4 and t < self.T["final_center_t"]:
-                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8,
-                                          wmax=(DUEL["opening_arm_m"] if self.opening else None))
+                    cr_keep = base.PARAMS["cube_range"]
+                    if at_cap:
+                        base.PARAMS["cube_range"] = 0.0
+                    try:
+                        econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8,
+                                              wmax=(DUEL["opening_arm_m"] if self.opening else None))
+                    finally:
+                        base.PARAMS["cube_range"] = cr_keep
                 if econ is not None:
                     goal, mode = econ
                 elif self.opening:
@@ -762,7 +883,8 @@ class Duelist(base.Bot):
                         goal, mode = self.cover, "open-hide"
                 else:
                     fg = None
-                    if hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk:
+                    if hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk \
+                            and not (at_cap and armed_now):
                         fg = self.farm_seek(obs, x, y, z)
                     eg = None
                     if fg is None and DUEL["explore"] and hpf >= 0.5 and t < self.endgame_t and not zone_urgent:
@@ -790,7 +912,7 @@ class Duelist(base.Bot):
         # strafe across the line of fire of the nearest shooter (or the target) while in a fight
         fight_ref = target if target is not None else (shooters[0][0] if shooters else None)
         strafing = False
-        if fight_ref is not None and mode not in ("zone",) and target is not None and target.get("kind") == "mech":
+        if fight_ref is not None and mode not in ("zone", "drop-push", "drop-hold") and target is not None and target.get("kind") == "mech":
             if t >= self.strafe_next:
                 self.strafe_sign = -self.strafe_sign
                 self.strafe_next = t + self.rng.uniform(DUEL["strafe_min"], DUEL["strafe_max"])
@@ -816,6 +938,12 @@ class Duelist(base.Bot):
                         if energy > 25 and me.get("grounded", True):
                             boost = True
                         break
+        if DUEL["step_move"] and target is not None and target.get("kind") == "mech" \
+                and mode in ("fight", "fight-close", "fight-back") \
+                and abs(hyp(x, y, target["pos"][0], target["pos"][1]) - pref) < DUEL["step_band_m"]:
+            sv = self.fight_step(obs, x, y, z, target, enemies, pref, t, eye_h, muz_h)
+            if sv is not None:
+                mv, strafing = sv, True
         dodge = self.mortar_dodge(obs, x, y, z, vx, vy, t)
         if dodge is not None:
             mv = list(dodge)
@@ -834,7 +962,7 @@ class Duelist(base.Bot):
         # ---- stuck: only judged while walking to a goal (not while strafing in place or charging)
         jump = False
         charging = any(w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0 for w in weapons)
-        if goal is not None and not strafing and not charging and mode != "dodge" and not dodging:
+        if goal is not None and not strafing and not charging and mode != "dodge" and not dodging and mode != "drop-hold":
             self.goal_hist.append((x, y))
             del self.goal_hist[:-11]
             if len(self.goal_hist) == 11 and hyp(self.goal_hist[0][0], self.goal_hist[0][1], x, y) < 1.5:
@@ -866,7 +994,9 @@ class Duelist(base.Bot):
         fire = [False, False]
         aim = None
         shoot_at = target
-        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies and not self.opening:
+        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and \
+                (not enemies or (DUEL["farm_seen"] and hpf >= DUEL["farm_seen_hp"] and t - self.last_damage_t > 4.0)) \
+                and not self.opening and not (at_cap and armed_now):
             shoot_at = self.farm_target(obs, x, y, z, muz_h)
         if shoot_at is None:
             # drones shooting us
@@ -888,10 +1018,39 @@ class Duelist(base.Bot):
                         full = st.get("charge", 0.75) or 0.75
                         mn = st.get("min_frac", 0.35)
                         dmg = st.get("damage", 315.0) * (mn + (1 - mn) * min(1.0, wpn["charge"] / full)) * my_mult
-                        if (shoot_at.get("hp") or 1e9) <= 0.95 * dmg:
+                        if (shoot_at.get("hp") or 1e9) <= DUEL["lethal_k"] * dmg:
                             fire[sl] = False
             if mode == "heal" and shoot_at.get("kind") != "mech":
                 fire = [False, False]  # dealing damage restarts the regen clock
+        if aim is None and DUEL["spawn_sweep"] and t - self.last_damage_t > 3.0:
+            unarmed = not any(k in ("laser", "lightning") for k in kinds)
+            if t < 0.3 or (unarmed and t - self.sw_last > 12.0 and not any(
+                    kd in ("laser", "lightning") and hyp(x, y, ps[0], ps[1]) < 250.0
+                    for (kd, ps, ts) in self.mem_pick.values())):
+                self.sw_last, self.sw_until = t, t + 1.7
+            if t < self.sw_until:
+                cur = (me.get("aim") or self.last_aim)[0]
+                aim = [wrap(cur + 1.2), 0.0]
+        if DUEL["hop_scan"] and t - self.last_damage_t > 3.0:
+            # no laser or lightning held or known after the ground sweep: jet straight up for hop_s while
+            # turning (38% of spawns cannot see the nearest one from the ground, and then only 30% are
+            # armed by 20 s against 67%); again every 25 s while that stays true and nobody is near
+            if self.hop_air:
+                cur = (me.get("aim") or self.last_aim)[0]
+                if shoot_at is None:
+                    aim = [wrap(cur + 1.2), 0.0]
+                if t < self.hop_until and energy > 12:
+                    boost = True
+                elif me.get("grounded", True) or t > self.hop_until + 4.0:
+                    self.hop_air = False
+            elif target is None and t >= self.sw_until and t > 1.5 and t - self.hop_last > 25.0 \
+                    and me.get("grounded", True) and energy > 60 \
+                    and not any(k in ("laser", "lightning") for k in kinds) \
+                    and not any(kd in ("laser", "lightning") and hyp(x, y, ps[0], ps[1]) < 250.0
+                                for (kd, ps, ts) in self.mem_pick.values()) \
+                    and not any(hyp(x, y, m["pos"][0], m["pos"][1]) < 110.0 for m in enemies):
+                self.hop_air, self.hop_until, self.hop_last = True, t + DUEL["hop_s"], t
+                jump = boost = True
         if aim is None:
             aim = self.scan_aim(obs, x, y, t, mv, threats)
         g0 = weapons[0] if weapons else None
@@ -904,6 +1063,8 @@ class Duelist(base.Bot):
         n = math.hypot(*mv)
         if n > 0.998:
             mv = [mv[0] * 0.998 / n, mv[1] * 0.998 / n]
+        if DUEL["no_fire_after"] > 0 and t >= DUEL["no_fire_after"]:
+            fire = [False, False]
         act.update(move=[round(mv[0], 3), round(mv[1], 3)], aim=[round(aim[0], 4), round(aim[1], 4)],
                    fire=fire, boost=bool(boost), jump=bool(jump))
         self.drop_mortar(obs, act)
