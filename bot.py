@@ -39,6 +39,9 @@ base.PARAMS["arm_late_range"] = 300.0
 # Free-for-all switch: one "a mech lost HP and it was not us" event also happens in practice (drones,
 # splash), and the squad simulator flipped 5 of 48 practice matches into hiding on it. Ask for three.
 base.PARAMS["ffa_ev_needed"] = 3
+# free-for-all economy (base bot): farm unless a mech is this close; defaults keep the old behaviour
+base.PARAMS.update({"ffa_hostile_m": 150.0, "ffa_hide_m": 150.0, "ffa_farm_fast": True})
+base.PARAMS.update({"ffa_zone_depth": 0.0, "ffa_rotate_early": False, "ffa_zone_lead_s": 15.0})
 FARM_STAND_DRONE = 55.0   # m: outside the drone's 45 m aggro range, close enough for accurate fire
 FARM_STAND_CRATE = 12.0
 
@@ -97,12 +100,21 @@ DUEL = {
     "finish_in": True,
     # free-for-all switch: one mech death we did not cause (and were not shooting at) before this time
     "ffa_death": True,
-    "ffa_death_until": 100.0,
+    "open_cautious": False,
+    # narrower opening: only "never fire first at range" until squad_t; farming and arming as usual
+    "open_noshoot": False,
+    # light opening: never fire first at range and break line of sight while a mech is in view; farming,
+    # arming and exploring go on as usual whenever no mech is in view
+    "open_lite": False,
+    "squad_t": 30.0,
+    "opening_arm_m": 150.0,
+    "ffa_death_until": 45.0,
     # sidestep visible gun bullets: in the squad loop / on top of the base bot in a free-for-all
     "sq_dodge": False,
     "ffa_dodge": False,
     "dodge_margin": 0.3,
     "dodge_horizon_s": 1.0,
+    "log_dec": False,
     "finish_m": 14.0,
     "heal_ignore_wanderers": False,
     "explore_r": [90.0, 160.0],
@@ -145,6 +157,9 @@ class Duelist(base.Bot):
         self.alive0: Optional[int] = None
         self.foreign_since: Optional[float] = None
         self.my_mech_kills = 0
+        self.opening = False
+        self.noshoot = False
+        self.lite = False
 
     # ------------------------------------------------------------------ inputs
     def ingest(self, obs, me, x, y, z, eye_h, t) -> None:
@@ -210,6 +225,11 @@ class Duelist(base.Bot):
                     mf.log(f"free-for-all: {foreign} death(s) we did not cause by t={t:.1f}")
             else:
                 self.foreign_since = None
+        if DUEL["log_dec"]:
+            self.log_cues(obs)
+        self.opening = bool(DUEL["open_cautious"]) and (not self.ffa) and t < DUEL["squad_t"]
+        self.noshoot = bool(DUEL["open_noshoot"]) and (not self.ffa) and t < DUEL["squad_t"]
+        self.lite = bool(DUEL["open_lite"]) and (not self.ffa) and t < DUEL["squad_t"]
 
     def drop_mortar(self, obs, act: Dict[str, Any]) -> Dict[str, Any]:
         """Drop a held mortar (slot 1) unless this action already takes or drops something."""
@@ -256,7 +276,11 @@ class Duelist(base.Bot):
         mid = int(m["id"])
         if t - self.attackers.get(mid, -99) < DUEL["hunt_recent_s"] or (mid == self.tgt_id and t - self.tgt_t < 3.0):
             return True
-        if dm < DUEL["hunt_close_m"] or frac < DUEL["hunt_low_frac"]:
+        if dm < DUEL["hunt_close_m"]:
+            return True
+        if self.opening or self.noshoot or self.lite:
+            return False  # match type unknown: never fire first at range
+        if frac < DUEL["hunt_low_frac"]:
             return True
         v = m.get("vel") or [0.0, 0.0, 0.0]
         d = max(1.0, hyp(x, y, m["pos"][0], m["pos"][1]))
@@ -433,7 +457,44 @@ class Duelist(base.Bot):
                 alt = self.dodge_bullets(obs, me, x, y, z, me["vel"][0], me["vel"][1], mv, slow)
                 if alt is not None:
                     act["move"] = [round(alt[0] * 0.998, 3), round(alt[1] * 0.998, 3)]
+        if DUEL["log_dec"] and int(obs["t"] * 10) % 10 == 0:
+            self.log_dec("F", obs)
         return act
+
+    def log_cues(self, obs: Dict[str, Any]) -> None:
+        """Test builds only: what can be heard and seen in the first seconds (match-type cues)."""
+        t = obs["t"]
+        if t > 12.05:
+            return
+        c = self.__dict__.setdefault("_cue", {"snd": {}, "hurt": set(), "armed": set(), "dmg": 0})
+        for sd in obs.get("sounds") or []:
+            if sd.get("age", 0) <= 0.1:
+                k = f"{sd.get('kind')}:{sd.get('dist')}"
+                c["snd"][k] = c["snd"].get(k, 0) + 1
+        me = obs["self"]
+        for m in obs.get("mechs") or []:
+            if m.get("kind") == "mech" and m.get("id") != me.get("id"):
+                if (m.get("hp") or 0) < (m.get("max_hp") or 0) - 1:
+                    c["hurt"].add(m["id"])
+                if any(w in ("laser", "lightning", "mortar") for w in (m.get("weapons") or [])):
+                    c["armed"].add(m["id"])
+        if any(e.get("type") == "damaged" for e in obs.get("events") or []):
+            c["dmg"] += 1
+        if abs(t - round(t)) < 0.01 and int(round(t)) in (2, 4, 6, 8, 10, 12):
+            mf.log(f"CUE t={t:.0f} snd={sorted(c['snd'].items())} hurt={len(c['hurt'])} armed={len(c['armed'])} "
+                   f"dmg={c['dmg']} alive={obs.get('alive')}")
+
+    def log_dec(self, tag: str, obs: Dict[str, Any]) -> None:
+        """Test builds only: one line a second for failure analysis (mode, HP, who is near, zone)."""
+        me = obs["self"]
+        x, y = me["pos"][0], me["pos"][1]
+        en = [m for m in obs.get("mechs") or [] if m.get("kind") == "mech" and m.get("id") != me.get("id")]
+        dn = min((hyp(x, y, m["pos"][0], m["pos"][1]) for m in en), default=-1.0)
+        zn = obs["zone"]
+        mf.log(f"DEC{tag} t={obs['t']:.1f} mode={self.mode} hp={me['hp']:.0f}/{me['max_hp']:.0f} seen={len(en)} "
+               f"near={dn:.0f} w={'+'.join(w['kind'] for w in (me.get('weapons') or []) if w)} "
+               f"cubes={me.get('cubes', 0)} zr={zn['radius']:.0f} zd={hyp(x, y, zn['center'][0], zn['center'][1]):.0f} "
+               f"alive={obs.get('alive')} open={int(self.opening)}")
 
     # ------------------------------------------------------------------ decision
     def _act(self, obs: Dict[str, Any], t0: float) -> Dict[str, Any]:
@@ -682,9 +743,23 @@ class Duelist(base.Bot):
                 if dg is not None:
                     econ = (dg, "drop")
                 elif hpf >= 0.4 and t < self.T["final_center_t"]:
-                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8)
+                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8,
+                                          wmax=(DUEL["opening_arm_m"] if self.opening else None))
                 if econ is not None:
                     goal, mode = econ
+                elif self.opening:
+                    mode = "open-hold"
+                    if enemies and W is not None:
+                        if self.cover is None or t - self.cover_t > 1.0:
+                            self.choose_cover(obs, x, y, z, threats, t)
+                        if self.cover is not None and hyp(x, y, *self.cover) > 2.0:
+                            goal, mode = self.cover, "open-hide"
+                elif self.lite and enemies and W is not None and not zone_urgent:
+                    mode = "open-hold"
+                    if self.cover is None or t - self.cover_t > 1.0:
+                        self.choose_cover(obs, x, y, z, threats, t)
+                    if self.cover is not None and hyp(x, y, *self.cover) > 2.0:
+                        goal, mode = self.cover, "open-hide"
                 else:
                     fg = None
                     if hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk:
@@ -791,7 +866,7 @@ class Duelist(base.Bot):
         fire = [False, False]
         aim = None
         shoot_at = target
-        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies:
+        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies and not self.opening:
             shoot_at = self.farm_target(obs, x, y, z, muz_h)
         if shoot_at is None:
             # drones shooting us
@@ -833,6 +908,8 @@ class Duelist(base.Bot):
                    fire=fire, boost=bool(boost), jump=bool(jump))
         self.drop_mortar(obs, act)
         self.mode = mode
+        if DUEL["log_dec"] and int(t * 10) % 10 == 0:
+            self.log_dec("S", obs)
         mf.draw.label(f"S {mode} hp{hp:.0f} th{n_threat} tg{self.tgt_id}")
         return act
 
