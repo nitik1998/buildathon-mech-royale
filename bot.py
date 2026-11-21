@@ -27,7 +27,7 @@ base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
 # holding a mortar takes +60% from lasers (cook-off). Rank it below an empty slot so we never take it,
 # and drop one if we are holding it (frees the slot for a laser or lightning).
 NO_MORTAR = True
-RNG_SALT = 2
+RNG_SALT = 1
 if NO_MORTAR:
     base.WEAPON_RANK["mortar"] = -1
 # Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
@@ -56,7 +56,7 @@ DUEL = {
     "retreat_hp_2": 0.55,
     "retreat_hp_3": 0.80,
     # finish a target below this HP fraction even when we would otherwise retreat (if we are above 20%)
-    "finish_frac": 0.25,
+    "finish_frac": 0.38,
     # heal in place after a fight until this HP fraction, starting below heal_start
     "heal_start": 0.60,
     "heal_until": 0.90,
@@ -94,12 +94,17 @@ DUEL = {
     "multi_focus": False,
     # full-strength theme: upgrade order ("plating_first" = v13), keep healing with only non-hunters in
     # sight, explore hop distances
-    "upgrade_mode": "plating_first",
+    "upgrade_mode": "laser_first",
     # kill speed: release a partial laser charge when it already kills; close to finish_m on a weak target
     "lethal_laser": True,
     "finish_in": True,
     # free-for-all switch: one mech death we did not cause (and were not shooting at) before this time
     "ffa_death": True,
+    "stick_bonus": 200.0,
+    "finish_me": 0.42,
+    "farm_seen": False,
+    "farm_seen_hp": 0.85,
+    "spawn_sweep": False,
     "open_cautious": False,
     # narrower opening: only "never fire first at range" until squad_t; farming and arming as usual
     "open_noshoot": False,
@@ -115,7 +120,7 @@ DUEL = {
     "dodge_margin": 0.3,
     "dodge_horizon_s": 1.0,
     "log_dec": False,
-    "finish_m": 14.0,
+    "finish_m": 20.0,
     "heal_ignore_wanderers": False,
     "explore_r": [90.0, 160.0],
     "isolate": False,
@@ -157,6 +162,8 @@ class Duelist(base.Bot):
         self.alive0: Optional[int] = None
         self.foreign_since: Optional[float] = None
         self.my_mech_kills = 0
+        self.sw_until = -1.0
+        self.sw_last = -99.0
         self.opening = False
         self.noshoot = False
         self.lite = False
@@ -519,6 +526,9 @@ class Duelist(base.Bot):
             order = UPGRADES
             if DUEL["upgrade_mode"] == "nanites_first":
                 order = ["nanites", "plating", "armor"] + [u for u in UPGRADES if u not in ("nanites", "plating", "armor")]
+            elif DUEL["upgrade_mode"] == "laser_first":
+                first = ["plating", "armor", "laser_damage", "laser_charge", "nanites", "gun_damage", "gun_rate"]
+                order = first + [u for u in UPGRADES if u not in first]
             elif DUEL["upgrade_mode"] == "damage_first":
                 order = ["laser_damage", "gun_damage", "plating", "laser_charge", "gun_rate", "armor", "nanites"] + \
                     [u for u in UPGRADES if u not in ("laser_damage", "gun_damage", "plating", "laser_charge", "gun_rate", "armor", "nanites")]
@@ -583,7 +593,7 @@ class Duelist(base.Bot):
                 if t - self.attackers.get(mid, -99) < 3.0:
                     cost -= 50.0
                 if mid == self.tgt_id and t - self.tgt_t < 2.0:
-                    cost -= 40.0
+                    cost -= DUEL["stick_bonus"]
             if cost < best:
                 best, target = cost, m
         if DUEL["multi_focus"] and n_threat >= 2:
@@ -614,7 +624,7 @@ class Duelist(base.Bot):
             retreat = True
         elif hpf < DUEL["retreat_hp_1"] and (tfrac is None or hpf < tfrac + 0.1):
             retreat = True
-        finishing = target is not None and tfrac is not None and tfrac < DUEL["finish_frac"] and hpf > 0.2 \
+        finishing = target is not None and tfrac is not None and tfrac < DUEL["finish_frac"] and hpf > DUEL["finish_me"] \
             and n_threat <= 2
         if finishing:
             retreat = False
@@ -866,7 +876,9 @@ class Duelist(base.Bot):
         fire = [False, False]
         aim = None
         shoot_at = target
-        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies and not self.opening:
+        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and \
+                (not enemies or (DUEL["farm_seen"] and hpf >= DUEL["farm_seen_hp"] and t - self.last_damage_t > 4.0)) \
+                and not self.opening:
             shoot_at = self.farm_target(obs, x, y, z, muz_h)
         if shoot_at is None:
             # drones shooting us
@@ -892,6 +904,15 @@ class Duelist(base.Bot):
                             fire[sl] = False
             if mode == "heal" and shoot_at.get("kind") != "mech":
                 fire = [False, False]  # dealing damage restarts the regen clock
+        if aim is None and DUEL["spawn_sweep"] and t - self.last_damage_t > 3.0:
+            unarmed = not any(k in ("laser", "lightning") for k in kinds)
+            if t < 0.3 or (unarmed and t - self.sw_last > 12.0 and not any(
+                    kd in ("laser", "lightning") and hyp(x, y, ps[0], ps[1]) < 250.0
+                    for (kd, ps, ts) in self.mem_pick.values())):
+                self.sw_last, self.sw_until = t, t + 1.7
+            if t < self.sw_until:
+                cur = (me.get("aim") or self.last_aim)[0]
+                aim = [wrap(cur + 1.2), 0.0]
         if aim is None:
             aim = self.scan_aim(obs, x, y, t, mv, threats)
         g0 = weapons[0] if weapons else None
