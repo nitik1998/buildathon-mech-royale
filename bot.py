@@ -77,7 +77,7 @@ DUEL = {
     "hunt_low_frac": 0.3,
     # target choice: "cost" = least expected HP lost to kill it (absolute HP, both sides' damage rates);
     # "frac" = distance + HP fraction (v1-v9)
-    "target_mode": "cost",
+    "target_mode": "frac",
     # explore instead of idling: walk to unvisited spots inside the next circle (cells of explore_cell_m)
     "explore": True,
     "explore_cell_m": 50.0,
