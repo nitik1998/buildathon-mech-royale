@@ -45,7 +45,7 @@ DUEL = {
     # finish a target below this HP fraction even when we would otherwise retreat (if we are above 20%)
     "finish_frac": 0.25,
     # heal in place after a fight until this HP fraction, starting below heal_start
-    "heal_start": 0.60,
+    "heal_start": 0.80,
     "heal_until": 0.90,
     # strafe flip interval (s)
     "strafe_min": 0.35,
