@@ -78,6 +78,9 @@ DUEL = {
     # target choice: "cost" = least expected HP lost to kill it (absolute HP, both sides' damage rates);
     # "frac" = distance + HP fraction (v1-v9)
     "target_mode": "cost",
+    # explore instead of idling: walk to unvisited spots inside the next circle (cells of explore_cell_m)
+    "explore": True,
+    "explore_cell_m": 50.0,
     # last stand: when we would retreat but this many enemies are already within 150 m, retreating rarely
     # saves us (we die with our back turned); fight the weakest instead (99 = off)
     "last_stand_n": 99,
@@ -103,6 +106,9 @@ class Duelist(base.Bot):
         self.healing = False
         self.dead: set = set()
         self.goal_hist: List[Tuple[float, float]] = []
+        self.visited: Dict[Tuple[int, int], int] = {}
+        self.explore_wp: Optional[Tuple[float, float]] = None
+        self.explore_t = -99.0
 
     # ------------------------------------------------------------------ inputs
     def ingest(self, obs, me, x, y, z, eye_h, t) -> None:
@@ -166,6 +172,39 @@ class Duelist(base.Bot):
         d = max(1.0, hyp(x, y, m["pos"][0], m["pos"][1]))
         closing = (v[0] * (x - m["pos"][0]) + v[1] * (y - m["pos"][1])) / d
         return closing > DUEL["hunt_closing_mps"]
+
+    def explore_goal(self, obs, x, y, t, me_id) -> Optional[Tuple[float, float]]:
+        """Nothing to do: walk to the least-visited reachable spot 90-160 m away that stays inside the next
+        circle (and the current one), away from known mechs, so the torso sweep finds drones, crates and
+        weapons instead of idling at the zone goal."""
+        W = self.world
+        cell = DUEL["explore_cell_m"]
+        k0 = (int(x // cell), int(y // cell))
+        self.visited[k0] = self.visited.get(k0, 0) + 1
+        if self.explore_wp is not None and hyp(x, y, *self.explore_wp) > 8 and t - self.explore_t < 20 \
+                and self.safe_point(obs, *self.explore_wp, t) < 1:
+            return self.explore_wp
+        zn = obs["zone"]
+        ncx, ncy, nr = zn["next_center"][0], zn["next_center"][1], zn["next_radius"]
+        cx, cy, cr = zn["center"][0], zn["center"][1], zn["radius"]
+        known = self.known_mechs(t, me_id)
+        best, bs = None, -1e9
+        for k in range(16):
+            a = k * math.pi / 8 + (0.2 if int(t) % 2 else 0.0)
+            for r in (90.0, 160.0):
+                px, py = x + r * math.cos(a), y + r * math.sin(a)
+                if hyp(px, py, ncx, ncy) > max(10.0, nr - 15.0) or hyp(px, py, cx, cy) > cr - 15.0:
+                    continue
+                if W is not None and not W.walkable(px, py):
+                    continue
+                ci, cj = int(px // cell), int(py // cell)
+                seen = sum(self.visited.get((ci + i, cj + j), 0) for i in (-1, 0, 1) for j in (-1, 0, 1))
+                sc = -seen - r / 100.0 - 3.0 * self.safe_point(obs, px, py, t)
+                sc -= 20.0 * sum(1 for (kx, ky) in known if hyp(kx, ky, px, py) < 120.0)
+                if sc > bs:
+                    bs, best = sc, (px, py)
+        self.explore_wp, self.explore_t = best, t
+        return best
 
     def farm_seek(self, obs, x, y, z) -> Optional[Tuple[float, float]]:
         """Walk toward the nearest seen drone (2 cubes) or crate (1 cube) in the safe zone, stopping
@@ -439,8 +478,13 @@ class Duelist(base.Bot):
                     fg = None
                     if hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk:
                         fg = self.farm_seek(obs, x, y, z)
+                    eg = None
+                    if fg is None and DUEL["explore"] and hpf >= 0.5 and t < self.endgame_t and not zone_urgent:
+                        eg = self.explore_goal(obs, x, y, t, my_id)
                     if fg is not None:
                         goal, mode = fg, "farm-seek"
+                    elif eg is not None:
+                        goal, mode = eg, "explore"
                     elif zdist > 3:
                         goal, mode = (zgx, zgy), "travel"
                     else:
