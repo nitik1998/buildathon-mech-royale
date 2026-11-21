@@ -75,6 +75,9 @@ DUEL = {
     "hunt_close_m": 60.0,
     "hunt_closing_mps": 3.0,
     "hunt_low_frac": 0.3,
+    # target choice: "cost" = least expected HP lost to kill it (absolute HP, both sides' damage rates);
+    # "frac" = distance + HP fraction (v1-v9)
+    "target_mode": "cost",
     # last stand: when we would retreat but this many enemies are already within 150 m, retreating rarely
     # saves us (we die with our back turned); fight the weakest instead (99 = off)
     "last_stand_n": 99,
@@ -261,6 +264,8 @@ class Duelist(base.Bot):
             shooters.append((m, dm))
         n_threat = len([1 for (m, dm) in shooters if dm < 200 or t - self.attackers.get(int(m["id"]), -99) < 3])
 
+        my_mult = 1.0 + 0.04 * min(me.get("cubes", 0) or 0, 10)
+        my_speed = math.hypot(vx, vy)
         # ---- target: one mech at a time, sticky, weakest and closest first, attackers first
         target, best = None, 1e9
         for m in enemies[:6]:
@@ -275,11 +280,26 @@ class Duelist(base.Bot):
             if DUEL["only_hunters"] and not self.is_hunting(m, x, y, dm, frac, t):
                 continue  # a house bot we damage joins the hunt: leave the ones not after us alone
             friends = sum(1 for o in enemies if o is not m and hyp(o["pos"][0], o["pos"][1], mx, my_) < 40)
-            cost = dm + 120.0 * frac + 25.0 * friends
-            if t - self.attackers.get(mid, -99) < 3.0:
-                cost -= 50.0
-            if mid == self.tgt_id and t - self.tgt_t < 2.0:
-                cost -= 40.0
+            if DUEL["target_mode"] == "cost":
+                # expected HP we lose killing it: its absolute HP over our damage rate at this range, times
+                # its damage rate on us (its visible weapons and cubes); friends near it shoot back too
+                tv = m.get("vel") or [0.0, 0.0, 0.0]
+                our = my_mult * sum(self.weapon_dps(k, dm, math.hypot(tv[0], tv[1])) for k in kinds)
+                tk = [k if isinstance(k, str) else (k or {}).get("kind") for k in (m.get("weapons") or ["gun"])]
+                tmult = 1.0 + 0.04 * min(m.get("cubes") or 0, 10)
+                their = 0.8 * tmult * sum(self.weapon_dps(k, dm, my_speed) for k in tk)
+                ttk = (m.get("hp") or 1400.0) / max(our, 1.0)
+                cost = ttk * their * (1.0 + 0.7 * friends) + dm * 0.5
+                if t - self.attackers.get(mid, -99) < 3.0:
+                    cost *= 0.6
+                if mid == self.tgt_id and t - self.tgt_t < 2.0:
+                    cost *= 0.7
+            else:
+                cost = dm + 120.0 * frac + 25.0 * friends
+                if t - self.attackers.get(mid, -99) < 3.0:
+                    cost -= 50.0
+                if mid == self.tgt_id and t - self.tgt_t < 2.0:
+                    cost -= 40.0
             if cost < best:
                 best, target = cost, m
         if target is not None:
