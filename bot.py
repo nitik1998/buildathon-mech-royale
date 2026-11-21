@@ -103,6 +103,14 @@ DUEL = {
     "ffa_farm_stop": 150.0,
     "ffa_arm_m": 250.0,
     "farm_clear_m": 200.0,     # farm only with no known mech this close (opening and free-for-all)
+    # look for a weapon at once: turn the torso a full circle at spawn, and if no laser or lightning is in
+    # sight jet straight up for hop_s while turning (from ~20 m up, 92% of spawn points see one within
+    # 200 m, against 76% from the ground). Repeated every rescan_s while still unarmed and nobody is near.
+    "scan_hop": True,
+    "scan_turn_s": 1.7,
+    "hop_s": 2.3,
+    "rescan_s": 25.0,
+    "scan_clear_m": 110.0,
     # sidestep visible bullets (off = random strafing only)
     "bullet_dodge": False,
     "dodge_margin": 0.3,
@@ -161,6 +169,11 @@ class Duelist(base.Bot):
         self.my_mech_kills = 0
         self.foreign_since: Optional[float] = None
         self.opening = True
+        self.scan_until = -1.0      # torso sweep on the ground until this time
+        self.hop_until = -1.0       # jetting up until this time
+        self.hop_air = False        # in the air after a scan hop (keep sweeping until we land)
+        self.last_scan_t = -99.0
+        self.scans = 0
         self.my_hits: Dict[int, float] = {}       # mech id -> last time we hit it
         self.hp_seen: Dict[int, Tuple[float, float]] = {}
         self.third_dmg: Dict[int, float] = {}     # mech id -> last time someone else damaged it
@@ -361,6 +374,70 @@ class Duelist(base.Bot):
                 bk, best = key, [cx, cy]
         return best
 
+    def scan_wanted(self, me, t, weapons) -> bool:
+        """Cheap test: is a weapon scan running, or due (unarmed, none known, rescan time reached)?"""
+        if self.hop_air or self.scan_until > 0:
+            return True
+        if any(w and w.get("kind") in ("laser", "lightning") for w in weapons):
+            return False
+        if t - self.last_scan_t <= DUEL["rescan_s"]:
+            return False
+        x, y = me["pos"][0], me["pos"][1]
+        return not any(kind in ("laser", "lightning") and hyp(x, y, pos[0], pos[1]) < 250.0
+                       for (kind, pos, ts) in self.mem_pick.values())
+
+    def weapon_scan(self, obs, me, x, y, z, t, enemies, weapons, act) -> bool:
+        """While we hold no laser or lightning and know of none to walk to: sweep the torso a full turn, then
+        hop on the jets and sweep again from height. Fills `act` and returns True while it is in control."""
+        if not DUEL["scan_hop"]:
+            return False
+        kinds = [w.get("kind") for w in weapons if w]
+        armed = any(k in ("laser", "lightning") for k in kinds)
+        cur = (me.get("aim") or self.last_aim or [0.0, 0.0])[0]
+        grounded = me.get("grounded", True)
+        energy = me.get("energy", 0.0) or 0.0
+        danger = t - self.last_damage_t < 3.0 or any(
+            hyp(x, y, m["pos"][0], m["pos"][1]) < DUEL["scan_clear_m"] for m in enemies)
+
+        def known_weapon() -> bool:
+            for pid, (kind, pos, ts) in self.mem_pick.items():
+                if kind in ("laser", "lightning") and hyp(x, y, pos[0], pos[1]) < 250.0 \
+                        and t - self.taken_fail.get(pid, -99) > 3.0 and self.econ_black.get(("p", pid), -99) <= t:
+                    return True
+            return False
+
+        def sweep(jump: bool, jet: bool) -> bool:
+            act.update(move=[0.0, 0.0], aim=[round(wrap(cur + 1.3), 4), 0.0], fire=[False, False],
+                       boost=bool(jet), jump=bool(jump))
+            self.last_aim = [wrap(cur + 1.3), 0.0]
+            return True
+
+        if self.hop_air:
+            # airborne part of a hop: jet while the timer runs, keep turning until we are back on the ground
+            if t < self.hop_until and energy > 12 and not danger:
+                return sweep(False, True)
+            if not grounded and t < self.hop_until + 4.0:
+                return sweep(False, False)
+            self.hop_air = False
+            return False
+        if armed or danger or not grounded:
+            self.scan_until = -1.0
+            return False
+        if t < self.scan_until:
+            return sweep(False, False)
+        if self.scan_until > 0 and t >= self.scan_until:
+            # ground sweep done: hop if it showed no laser or lightning
+            self.scan_until = -1.0
+            if not known_weapon() and energy > 60:
+                self.hop_until, self.hop_air = t + DUEL["hop_s"], True
+                return sweep(True, True)
+            return False
+        if t - self.last_scan_t > DUEL["rescan_s"] and not known_weapon():
+            self.last_scan_t, self.scans = t, self.scans + 1
+            self.scan_until = t + DUEL["scan_turn_s"]
+            return sweep(False, False)
+        return False
+
     def ffa_target_ok(self, m, x, y, dm, frac, t, late, alive_n, enemies, hp, my_mult) -> bool:
         """Free-for-all: whom may we fight? Attackers, mechs on top of us, a laser charging at us, the weak,
         the wounded leaving someone else's fight, and (late) lone mechs we are favoured against."""
@@ -506,6 +583,16 @@ class Duelist(base.Bot):
                         and me0["hp"] >= 0.6 * max(1.0, me0["max_hp"]):
                     use_base = False
             if use_base:
+                # the weapon scan still runs on top of the base bot (it needs this tick's memory update)
+                me0 = obs["self"]
+                w0 = me0.get("weapons") or [None, None]
+                if DUEL["scan_hop"] and self.scan_wanted(me0, obs["t"], w0):
+                    x0, y0, z0 = me0["pos"]
+                    e0 = [m for m in obs.get("mechs") or [] if m.get("kind") == "mech" and m.get("id") != me0.get("id")]
+                    self.ingest(obs, me0, x0, y0, z0, (me0.get("stats") or {}).get("eye_height", 8.0), obs["t"])
+                    act0: Dict[str, Any] = {}
+                    if self.weapon_scan(obs, me0, x0, y0, z0, obs["t"], e0, w0, act0):
+                        return self.drop_mortar(obs, act0)
                 return self.drop_mortar(obs, base.Bot._act(self, obs, t0))
         ffa = self.ffa
         me = obs["self"]
@@ -556,6 +643,10 @@ class Duelist(base.Bot):
             shooters.append((m, dm))
         n_threat = len([1 for (m, dm) in shooters if dm < 200 or t - self.attackers.get(int(m["id"]), -99) < 3])
 
+        if not shooters and self.weapon_scan(obs, me, x, y, z, t, enemies, weapons, act):
+            self.mode = "scan"
+            mf.draw.label(f"scan hp{hp:.0f}")
+            return self.drop_mortar(obs, act)
         my_mult = 1.0 + 0.04 * min(me.get("cubes", 0) or 0, 10)
         my_speed = math.hypot(vx, vy)
         alive_n = obs.get("alive") if isinstance(obs.get("alive"), int) else 16
