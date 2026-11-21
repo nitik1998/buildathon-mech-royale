@@ -86,6 +86,8 @@ PARAMS = {
     "ffa_ev_needed": 1,
     # evidence before ffa_min_t s is ignored (cuts squad false switches; FFA replays: 75% still detected by 20 s)
     "ffa_min_t": 8.0,
+    "ffa_home": False,
+    "ffa_home_every_s": 8.0,
     # free-for-all only: a seen mech is "hostile nearby" (no farming for 12 s) inside ffa_hostile_m, we
     # walk to cover when one is inside ffa_hide_m, and ffa_farm_fast walks to crates/drones at full speed
     "ffa_hostile_m": 230.0,
@@ -641,6 +643,7 @@ class Bot:
         urgent = out_now or need_speed > 0.75 * silent or (zone["shrink_start"] - t < lead_s and zdist > 5)
         # (2) quiet pre-rotation: a point ffa_zone_depth x radius from the next centre, walked to only when
         # nothing else is going on (no fight, loot, hiding or farming)
+        home = self.home_spot(obs, x, y, z, t) if (self.ffa and PARAMS["ffa_home"] and W) else None
         deep_goal = None
         if self.ffa and PARAMS["ffa_rotate_early"] and PARAMS["ffa_zone_depth"] > 0 \
                 and t < min(self.endgame_t, self.T["final_center_t"]):
@@ -746,6 +749,13 @@ class Bot:
                 goal = fg
                 mode = "farm-seek"
                 speed = 1.0 if (self.ffa and PARAMS["ffa_farm_fast"]) else PARAMS["silent_move"]
+            elif home is not None and not urgent:
+                if hyp(x, y, home[0], home[1]) > 3.0:
+                    goal = home
+                    mode = "home"
+                    speed = PARAMS["silent_move"] if need_speed < 0.8 * silent else 1.0
+                else:
+                    mode = "camp"
             elif deep_goal is not None:
                 goal = deep_goal
                 mode = "rotate"
@@ -1363,6 +1373,91 @@ class Bot:
                 self.cover_t = t
                 return
         self.cover, self.cover_score, self.cover_t = best, bs, t
+
+    def expo_at(self, px: float, py: float) -> Optional[float]:
+        """How visible is a mech standing here? The weighted share of places another mech could stand (12
+        bearings x 60 / 120 / 200 m, nearer ones count more) with a clear line of sight to it. Measured once
+        per 8 m cell and kept; at most expo_budget new cells per decision (None = not measured yet)."""
+        W = self.world
+        key = (int(px // 8), int(py // 8))
+        cache = self.__dict__.setdefault("expo_cache", {})
+        v = cache.get(key)
+        if v is not None:
+            return v
+        if self.__dict__.get("expo_budget", 0) <= 0:
+            return None
+        self.expo_budget -= 1
+        cx, cy = key[0] * 8 + 4.0, key[1] * 8 + 4.0
+        gz = W.floor[W.idx(cx, cy)]
+        seen = tot = 0.0
+        for k in range(12):
+            a = k * TAU / 12
+            ca, sa = math.cos(a), math.sin(a)
+            for d, w in ((60.0, 1.5), (120.0, 1.0), (200.0, 0.6)):
+                bx, by = cx + d * ca, cy + d * sa
+                if not W.walkable(bx, by):
+                    continue
+                tot += w
+                eye = (bx, by, W.floor[W.idx(bx, by)] + 8.0)
+                if not (W.sight_blocked(eye, (cx, cy, gz + 4.5)) and W.sight_blocked(eye, (cx, cy, gz + 8.5))):
+                    seen += w
+        v = seen / tot if tot > 0 else 0.0
+        cache[key] = v
+        return v
+
+    def home_spot(self, obs, x: float, y: float, z: float, t: float) -> Optional[Tuple[float, float]]:
+        """Free-for-all camp spot: the least visible place on our level inside the next circle within about
+        110 m, away from mechs we know of. Re-picked every ffa_home_every_s; a new spot must be clearly
+        better. In the top-16 showdowns exposure before the first fight decides the first minute: the least
+        seen quarter of mechs averaged 9.2 points, the most seen quarter 5.6."""
+        W = self.world
+        zn = obs["zone"]
+        ncx, ncy = zn["next_center"]
+        nr = zn["next_radius"]
+        inset = max(0.0, nr - min(30.0, 0.35 * nr + 3.0))
+        d = self.__dict__
+        home = d.get("home")
+        if home is not None and (hyp(ncx, ncy, home[0], home[1]) > inset or t < d.get("home_bad_until", -1.0)):
+            home = d["home"] = None
+        if home is not None and t - d.get("home_t", -99.0) < PARAMS["ffa_home_every_s"]:
+            return home
+        self.expo_budget = 25
+        known = self.known_mechs(t, (obs.get("self") or {}).get("id"))
+        bad = d.setdefault("home_bad", {})
+        gx, gy = 12.0 * round(x / 12.0), 12.0 * round(y / 12.0)
+        best, bs, cur_s, missing = None, 1e9, None, False
+        offs = sorted(((i, j) for i in range(-9, 10) for j in range(-9, 10)), key=lambda q: q[0] * q[0] + q[1] * q[1])
+        for (i, j) in offs:
+            px, py = gx + 12.0 * i, gy + 12.0 * j
+            if hyp(ncx, ncy, px, py) > inset or not W.walkable(px, py):
+                continue
+            if abs(W.floor[W.idx(px, py)] - z) > 4.0 or bad.get((int(px // 8), int(py // 8)), -1.0) > t:
+                continue
+            e = self.expo_at(px, py)
+            if e is None:
+                missing = True
+                continue
+            sc = 120.0 * e + 0.25 * hyp(x, y, px, py) + 40.0 * sum(1 for (kx, ky) in known if hyp(kx, ky, px, py) < 80.0)
+            sc += self.safe_point(obs, px, py, t)
+            if sc < bs:
+                bs, best = sc, (px, py)
+        if home is not None:
+            e = self.expo_at(home[0], home[1])
+            if e is not None:
+                cur_s = 120.0 * e + 0.25 * hyp(x, y, home[0], home[1]) + 40.0 * sum(
+                    1 for (kx, ky) in known if hyp(kx, ky, home[0], home[1]) < 80.0) + self.safe_point(obs, home[0], home[1], t)
+        if best is not None and (home is None or cur_s is None or bs < cur_s - 15.0):
+            home = d["home"] = best
+            d["home_set_t"], d["home_d0"] = t, hyp(x, y, best[0], best[1])
+        # a spot we cannot get closer to (walled courtyard, ledge) is dropped and avoided for a minute
+        if home is not None and t - d.get("home_set_t", t) > 8.0:
+            if hyp(x, y, home[0], home[1]) > 6.0 and hyp(x, y, home[0], home[1]) > d.get("home_d0", 0.0) - 6.0:
+                bad[(int(home[0] // 8), int(home[1] // 8))] = t + 60.0
+                d["home_bad_until"] = t + 0.2
+            else:
+                d["home_set_t"], d["home_d0"] = t, hyp(x, y, home[0], home[1])
+        d["home_t"] = t - (PARAMS["ffa_home_every_s"] - 1.5 if missing else 0.0)
+        return home
 
     # ------------------------------------------------------------------ steering
     def steer(self, x: float, y: float, goal: Tuple[float, float], t: float, me) -> List[float]:
