@@ -87,6 +87,20 @@ DUEL = {
     "target_mode": "frac",
     # explore instead of idling: walk to unvisited spots inside the next circle (cells of explore_cell_m)
     "explore": True,
+    # v17 candidates: focus the lowest-HP shooter when 2+ shoot at us; fight from a spot only the target sees
+    "multi_focus": False,
+    # full-strength theme: upgrade order ("plating_first" = v13), keep healing with only non-hunters in
+    # sight, explore hop distances
+    "upgrade_mode": "plating_first",
+    # kill speed: release a partial laser charge when it already kills; close to finish_m on a weak target
+    "lethal_laser": True,
+    "finish_in": True,
+    "finish_m": 14.0,
+    "heal_ignore_wanderers": False,
+    "explore_r": [90.0, 160.0],
+    "isolate": False,
+    "spot_radius": 14.0,
+    "spot_every_s": 1.0,
     "explore_cell_m": 50.0,
     # last stand: when we would retreat but this many enemies are already within 150 m, retreating rarely
     # saves us (we die with our back turned); fight the weakest instead (99 = off)
@@ -115,6 +129,8 @@ class Duelist(base.Bot):
         self.healing = False
         self.dead: set = set()
         self.goal_hist: List[Tuple[float, float]] = []
+        self.spot: Optional[Tuple[float, float]] = None
+        self.spot_t = -99.0
         self.visited: Dict[Tuple[int, int], int] = {}
         self.explore_wp: Optional[Tuple[float, float]] = None
         self.explore_t = -99.0
@@ -179,6 +195,37 @@ class Duelist(base.Bot):
                 act["drop"] = 1
         return act
 
+    def pick_spot(self, obs, x, y, z, target, others, t, muz_h) -> Optional[Tuple[float, float]]:
+        """A spot within spot_radius on our level from which we still hit the target but that the fewest
+        other known enemies can see (their eye to our body centre and top), with a small walk cost."""
+        W = self.world
+        tx, ty, tz = target["pos"]
+        deadline = self.tick_t0 + 0.004
+        best, bs = None, -1e9
+        cands = [(x, y)] + [(x + r * math.cos(k * math.pi / 6), y + r * math.sin(k * math.pi / 6))
+                            for r in (DUEL["spot_radius"] * 0.5, DUEL["spot_radius"]) for k in range(12)]
+        for (px, py) in cands:
+            if time.perf_counter() > deadline:
+                break
+            if (px, py) != (x, y):
+                if not W.walkable(px, py) or not W.line_clear(x, y, px, py) or self.safe_point(obs, px, py, t) >= 1:
+                    continue
+            gz = W.floor[W.idx(px, py)]
+            if abs(gz - z) > W.rise:
+                continue
+            if W.sight_blocked((px, py, gz + muz_h), (tx, ty, tz + 4.5)):
+                continue  # must keep shooting the target
+            seen = 0
+            for o in others:
+                ox, oy, oz = o["pos"]
+                eye = (ox, oy, oz + 8.0)
+                if not (W.sight_blocked(eye, (px, py, gz + 4.5)) and W.sight_blocked(eye, (px, py, gz + 8.5))):
+                    seen += 1
+            sc = -10.0 * seen - hyp(x, y, px, py) / 6.0 + (1.0 if (px, py) == (x, y) else 0.0)
+            if sc > bs:
+                bs, best = sc, (px, py)
+        return best
+
     def is_hunting(self, m, x, y, dm, frac, t) -> bool:
         """Is this mech after us? (attacked us lately, already our target, close, closing in, or weak)"""
         mid = int(m["id"])
@@ -209,7 +256,7 @@ class Duelist(base.Bot):
         best, bs = None, -1e9
         for k in range(16):
             a = k * math.pi / 8 + (0.2 if int(t) % 2 else 0.0)
-            for r in (90.0, 160.0):
+            for r in DUEL["explore_r"]:
                 px, py = x + r * math.cos(a), y + r * math.sin(a)
                 if hyp(px, py, ncx, ncy) > max(10.0, nr - 15.0) or hyp(px, py, cx, cy) > cr - 15.0:
                     continue
@@ -295,7 +342,13 @@ class Duelist(base.Bot):
 
         off = obs.get("offer")
         if off and off.get("choices"):
-            ranks = [UPGRADES.index(c.get("id")) if c.get("id") in UPGRADES else 99 for c in off["choices"]]
+            order = UPGRADES
+            if DUEL["upgrade_mode"] == "nanites_first":
+                order = ["nanites", "plating", "armor"] + [u for u in UPGRADES if u not in ("nanites", "plating", "armor")]
+            elif DUEL["upgrade_mode"] == "damage_first":
+                order = ["laser_damage", "gun_damage", "plating", "laser_charge", "gun_rate", "armor", "nanites"] + \
+                    [u for u in UPGRADES if u not in ("laser_damage", "gun_damage", "plating", "laser_charge", "gun_rate", "armor", "nanites")]
+            ranks = [order.index(c.get("id")) if c.get("id") in order else 99 for c in off["choices"]]
             act["pick"] = ranks.index(min(ranks))
 
         weapons = me.get("weapons") or [None, None]
@@ -359,6 +412,18 @@ class Duelist(base.Bot):
                     cost -= 40.0
             if cost < best:
                 best, target = cost, m
+        if DUEL["multi_focus"] and n_threat >= 2:
+            # several shooters: kill the one with the least HP first (fastest cut in incoming damage)
+            vis = []
+            for m in enemies[:6]:
+                mx, my_, mz = m["pos"]
+                dm = math.dist((x, y, z), (mx, my_, mz))
+                if dm > 230 or (W and W.sight_blocked((x, y, z + muz_h), (mx, my_, mz + 4.0))):
+                    continue
+                if t - self.attackers.get(int(m["id"]), -99) < 5.0 or dm < 120:
+                    vis.append(((m.get("hp") or 1400.0) + 2.0 * dm, m))
+            if vis:
+                target = min(vis, key=lambda q: q[0])[1]
         if target is not None:
             if int(target["id"]) != self.tgt_id:
                 self.tgt_id = int(target["id"])
@@ -393,7 +458,12 @@ class Duelist(base.Bot):
         quiet = not enemies and t - self.last_damage_t > 3.0
         if quiet and hpf < DUEL["heal_start"]:
             self.healing = True
-        if hpf >= DUEL["heal_until"] or (enemies and hpf >= 0.5):
+        heal_block = [m for m in enemies if not DUEL["heal_ignore_wanderers"]
+                      or self.is_hunting(m, x, y, hyp(x, y, m["pos"][0], m["pos"][1]), 1.0, t)]
+        if DUEL["heal_ignore_wanderers"] and quiet is False and not heal_block and t - self.last_damage_t > 3.0 \
+                and hpf < DUEL["heal_start"]:
+            self.healing = True
+        if hpf >= DUEL["heal_until"] or (heal_block and hpf >= 0.5):
             self.healing = False
 
         # ---- zone timing
@@ -434,7 +504,9 @@ class Duelist(base.Bot):
                 pref = DUEL["range_laser"]
             else:
                 pref = DUEL["range_gun"]
-            if finishing and pref > 50:
+            if finishing and DUEL["finish_in"]:
+                pref = DUEL["finish_m"]  # close right in: gun ~0.97 hit at 0-25 m, lightning in range
+            elif finishing and pref > 50:
                 pref = 50.0
             band = DUEL["range_band"]
             if d > pref + band:
@@ -450,6 +522,14 @@ class Duelist(base.Bot):
                     hold = True
             else:
                 hold = True
+            # with more than one enemy around, fight from a nearby spot where the others can't see us
+            if DUEL["isolate"] and W is not None and hold:
+                others = [m for m in enemies[:5] if m is not target]
+                if others:
+                    if self.spot is None or t - self.spot_t > DUEL["spot_every_s"]:
+                        self.spot, self.spot_t = self.pick_spot(obs, x, y, z, target, others, t, muz_h), t
+                    if self.spot is not None and hyp(x, y, *self.spot) > 2.0:
+                        goal, hold, mode = self.spot, False, "fight-spot"
             # a close cube or a better weapon is worth the detour while we keep shooting
             gun_only = not any(k in ("laser", "lightning") for k in kinds)
             wmax = DUEL["fight_weapon_gun_m"] if gun_only else DUEL["fight_weapon_armed_m"]
@@ -602,6 +682,20 @@ class Duelist(base.Bot):
                     break
         if shoot_at is not None:
             aim, fire = self.fire_control(me, shoot_at, weapons, x, y, z, muz_h)
+            if DUEL["lethal_laser"] and shoot_at.get("kind") == "mech":
+                # let go of a partial laser charge as soon as it already kills the target
+                cur = me.get("aim") or self.last_aim
+                tb = math.atan2(shoot_at["pos"][1] - y, shoot_at["pos"][0] - x)
+                dt_ = max(1.0, hyp(x, y, shoot_at["pos"][0], shoot_at["pos"][1]))
+                on = abs(wrap(tb - cur[0])) < math.atan2(self.radius * 0.8, dt_)
+                for sl, wpn in enumerate(weapons):
+                    if wpn and wpn.get("kind") == "laser" and (wpn.get("charge") or 0) > 0 and on:
+                        st = wpn.get("stats") or {}
+                        full = st.get("charge", 0.75) or 0.75
+                        mn = st.get("min_frac", 0.35)
+                        dmg = st.get("damage", 315.0) * (mn + (1 - mn) * min(1.0, wpn["charge"] / full)) * my_mult
+                        if (shoot_at.get("hp") or 1e9) <= 0.95 * dmg:
+                            fire[sl] = False
             if mode == "heal" and shoot_at.get("kind") != "mech":
                 fire = [False, False]  # dealing damage restarts the regen clock
         if aim is None:
