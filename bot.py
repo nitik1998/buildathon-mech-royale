@@ -23,6 +23,11 @@ from base import hyp, wrap
 
 # Laser first: hitscan to 280 m, and house guns rarely hit past ~100 m.
 base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
+# Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
+# 130 m, inside a drone's 1.8 m radius), and walk toward ones seen within 170 m.
+base.PARAMS.update({"farm_range": 130.0, "farm_seek_range": 170.0})
+FARM_STAND_DRONE = 55.0   # m: outside the drone's 45 m aggro range, close enough for accurate fire
+FARM_STAND_CRATE = 12.0
 
 DUEL = {
     # preferred fight range by best weapon held (m), and the dead band around it
@@ -131,6 +136,30 @@ class Duelist(base.Bot):
                 self.pseudo.append((x + dd * math.cos(b), y + dd * math.sin(b), 0.6, t))
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
+
+    def farm_seek(self, obs, x, y, z) -> Optional[Tuple[float, float]]:
+        """Walk toward the nearest seen drone (2 cubes) or crate (1 cube) in the safe zone, stopping
+        outside drone aggro range (they only chase when shot) or next to a crate."""
+        best, bd = None, base.PARAMS["farm_seek_range"]
+        t = obs["t"]
+        for m in obs.get("mechs") or []:
+            if m.get("kind") == "npc":
+                px, py, pz = m["pos"]
+                d = hyp(x, y, px, py)
+                if d < bd and abs(pz - z) < 5 and self.safe_point(obs, px, py, t) < 1:
+                    best, bd = (px, py, FARM_STAND_DRONE), d
+        for c in obs.get("crates") or []:
+            px, py, pz = c["pos"]
+            d = hyp(x, y, px, py)
+            if d < bd and abs(pz - z) < 4 and self.safe_point(obs, px, py, t) < 1:
+                best, bd = (px, py, FARM_STAND_CRATE), d
+        if best is None:
+            return None
+        px, py, stand = best
+        if bd <= stand:
+            return None
+        f = (bd - stand) / bd
+        return (x + (px - x) * f, y + (py - y) * f)
 
     def drop_goal(self, obs, x, y, t, me_id) -> Optional[Tuple[float, float]]:
         """The nearest supply drop worth taking: in range, landed or landing by the time we arrive, inside
