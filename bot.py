@@ -95,6 +95,14 @@ DUEL = {
     # kill speed: release a partial laser charge when it already kills; close to finish_m on a weak target
     "lethal_laser": True,
     "finish_in": True,
+    # free-for-all switch: one mech death we did not cause (and were not shooting at) before this time
+    "ffa_death": True,
+    "ffa_death_until": 100.0,
+    # sidestep visible gun bullets: in the squad loop / on top of the base bot in a free-for-all
+    "sq_dodge": False,
+    "ffa_dodge": False,
+    "dodge_margin": 0.3,
+    "dodge_horizon_s": 1.0,
     "finish_m": 14.0,
     "heal_ignore_wanderers": False,
     "explore_r": [90.0, 160.0],
@@ -134,6 +142,9 @@ class Duelist(base.Bot):
         self.visited: Dict[Tuple[int, int], int] = {}
         self.explore_wp: Optional[Tuple[float, float]] = None
         self.explore_t = -99.0
+        self.alive0: Optional[int] = None
+        self.foreign_since: Optional[float] = None
+        self.my_mech_kills = 0
 
     # ------------------------------------------------------------------ inputs
     def ingest(self, obs, me, x, y, z, eye_h, t) -> None:
@@ -160,6 +171,7 @@ class Duelist(base.Bot):
                     self.attackers.pop(tg, None)
                     self.mem_crate.pop(tg, None)
                     if tg < 100:
+                        self.my_mech_kills += 1
                         # forget the dead mech at once: its cubes are ours to collect, not a contested spot
                         self.dead.add(tg)
                         ml = self.mech_last.pop(tg, None)
@@ -185,6 +197,19 @@ class Duelist(base.Bot):
                 self.pseudo.append((x + dd * math.cos(b), y + dd * math.sin(b), 0.6, t))
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
+        alive = obs.get("alive")
+        if DUEL["ffa_death"] and isinstance(alive, int) and not self.ffa:
+            if self.alive0 is None:
+                self.alive0 = alive
+            foreign = (self.alive0 - alive) - self.my_mech_kills
+            if foreign > 0 and t < DUEL["ffa_death_until"] and t - self.focus_t > 4.0:
+                if self.foreign_since is None:
+                    self.foreign_since = t
+                elif t - self.foreign_since >= 0.5:
+                    self.ffa = True
+                    mf.log(f"free-for-all: {foreign} death(s) we did not cause by t={t:.1f}")
+            else:
+                self.foreign_since = None
 
     def drop_mortar(self, obs, act: Dict[str, Any]) -> Dict[str, Any]:
         """Drop a held mortar (slot 1) unless this action already takes or drops something."""
@@ -322,10 +347,98 @@ class Duelist(base.Bot):
             best, bd = (px, py), dist
         return best
 
+    def dodge_bullets(self, obs, me, x, y, z, vx, vy, mv, slow: float) -> Optional[List[float]]:
+        """Sidestep gun bullets we can see. For every visible enemy bullet that would pass through our body
+        on the planned move, predict where each candidate move puts us when the bullet arrives (ground
+        acceleration limits how fast our velocity can change) and take the candidate that is hit by the
+        fewest bullets, then the one with the widest miss. None = the planned move is already safe."""
+        st = me.get("stats") or {}
+        R = st.get("radius", self.radius) + 0.3 + DUEL["dodge_margin"]
+        H = st.get("height", self.body_h)
+        spd = st.get("walk_speed", self.walk) * slow
+        acc = max(1.0, st.get("ground_accel", self.accel))
+        threats = []
+        for p in obs.get("projectiles") or []:
+            if p.get("kind") not in ("gun", "npc"):
+                continue
+            px, py, pz = p["pos"]
+            bvx, bvy, bvz = p["vel"]
+            sp2 = bvx * bvx + bvy * bvy
+            if sp2 < 1.0:
+                continue
+            tca = ((x - px) * bvx + (y - py) * bvy) / sp2
+            if tca < 0.0 or tca > DUEL["dodge_horizon_s"]:
+                continue
+            mx, my = (x - px) - bvx * tca, (y - py) - bvy * tca
+            if mx * mx + my * my > (R + self.walk * 1.7 * tca + 1.0) ** 2:
+                continue  # passes too far away for any move of ours to matter
+            threats.append((px, py, pz, bvx, bvy, bvz, sp2, tca))
+        if not threats:
+            return None
+
+        def outcome(cx: float, cy: float) -> Tuple[int, float]:
+            tx_, ty_ = cx * spd, cy * spd
+            dvx, dvy = tx_ - vx, ty_ - vy
+            ta = math.hypot(dvx, dvy) / acc
+            hits, worst = 0, 1e9
+            for (px, py, pz, bvx, bvy, bvz, sp2, tca) in threats:
+                if ta > 1e-6 and tca <= ta:
+                    f = tca / ta
+                    qx = x + vx * tca + 0.5 * dvx * f * tca
+                    qy = y + vy * tca + 0.5 * dvy * f * tca
+                else:
+                    qx = x + vx * ta + 0.5 * dvx * ta + tx_ * (tca - ta)
+                    qy = y + vy * ta + 0.5 * dvy * ta + ty_ * (tca - ta)
+                t2 = ((qx - px) * bvx + (qy - py) * bvy) / sp2
+                miss = math.hypot((qx - px) - bvx * t2, (qy - py) - bvy * t2)
+                bz = pz + bvz * t2
+                if miss < R and z - 0.5 <= bz <= z + H + 0.5:
+                    hits += 1
+                worst = min(worst, miss)
+            return hits, worst
+
+        n = math.hypot(mv[0], mv[1])
+        plan = (mv[0] / n, mv[1] / n) if n > 1e-6 else (0.0, 0.0)
+        h0, w0 = outcome(*plan)
+        if h0 == 0:
+            return None
+        W = self.world
+        best, bk = None, (h0, -w0, 0.0)
+        # perpendiculars to the most urgent bullet first, then the compass
+        u = min(threats, key=lambda q: q[7])
+        bn = math.sqrt(u[6])
+        cands = [(-u[4] / bn, u[3] / bn), (u[4] / bn, -u[3] / bn), (-plan[0], -plan[1])]
+        cands += [(math.cos(k * math.pi / 4), math.sin(k * math.pi / 4)) for k in range(8)]
+        for (cx, cy) in cands:
+            if cx == 0.0 and cy == 0.0:
+                continue
+            if W is not None and not W.line_clear(x, y, x + 6.0 * cx, y + 6.0 * cy):
+                continue
+            h, w = outcome(cx, cy)
+            key = (h, -w, -(cx * plan[0] + cy * plan[1]))  # fewer hits, wider miss, closer to the plan
+            if key < bk:
+                bk, best = key, [cx, cy]
+        return best
+
+    def ffa_act(self, obs: Dict[str, Any], t0: float) -> Dict[str, Any]:
+        """Free-for-all: the survivor base bot decides; we only sidestep bullets on top of its move."""
+        act = base.Bot._act(self, obs, t0)
+        if DUEL["ffa_dodge"]:
+            me = obs["self"]
+            mv = act.get("move") or [0.0, 0.0]
+            if me.get("grounded", True) and not act.get("jump"):
+                weapons = me.get("weapons") or []
+                slow = 0.5 if any(w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0 for w in weapons) else 1.0
+                x, y, z = me["pos"]
+                alt = self.dodge_bullets(obs, me, x, y, z, me["vel"][0], me["vel"][1], mv, slow)
+                if alt is not None:
+                    act["move"] = [round(alt[0] * 0.998, 3), round(alt[1] * 0.998, 3)]
+        return act
+
     # ------------------------------------------------------------------ decision
     def _act(self, obs: Dict[str, Any], t0: float) -> Dict[str, Any]:
         if self.ffa:
-            return self.drop_mortar(obs, base.Bot._act(self, obs, t0))
+            return self.drop_mortar(obs, self.ffa_act(obs, t0))
         me = obs["self"]
         t = obs["t"]
         x, y, z = me["pos"]
@@ -636,11 +749,17 @@ class Duelist(base.Bot):
         n = math.hypot(*mv)
         if n > 1e-6:
             mv = [mv[0] / n, mv[1] / n]
+        dodging = False
+        if DUEL["sq_dodge"] and mode != "dodge" and me.get("grounded", True):
+            slow = 0.5 if any(w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0 for w in weapons) else 1.0
+            alt = self.dodge_bullets(obs, me, x, y, z, vx, vy, mv, slow)
+            if alt is not None:
+                mv, dodging = alt, True
 
         # ---- stuck: only judged while walking to a goal (not while strafing in place or charging)
         jump = False
         charging = any(w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0 for w in weapons)
-        if goal is not None and not strafing and not charging and mode != "dodge":
+        if goal is not None and not strafing and not charging and mode != "dodge" and not dodging:
             self.goal_hist.append((x, y))
             del self.goal_hist[:-11]
             if len(self.goal_hist) == 11 and hyp(self.goal_hist[0][0], self.goal_hist[0][1], x, y) < 1.5:
