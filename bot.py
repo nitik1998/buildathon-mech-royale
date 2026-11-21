@@ -99,7 +99,7 @@ DUEL = {
     "ffa_death": True,
     "ffa_death_until": 100.0,
     # sidestep visible gun bullets: in the squad loop / on top of the base bot in a free-for-all
-    "sq_dodge": False,
+    "sq_dodge": True,
     "ffa_dodge": False,
     "dodge_margin": 0.3,
     "dodge_horizon_s": 1.0,
