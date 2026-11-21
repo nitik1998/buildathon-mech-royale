@@ -23,6 +23,12 @@ from base import hyp, wrap
 
 # Laser first: hitscan to 280 m, and house guns rarely hit past ~100 m.
 base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
+# No mortar: real-server recordings show 0 hits in 9 shots, v9 held one 15% of the time, and a mech
+# holding a mortar takes +60% from lasers (cook-off). Rank it below an empty slot so we never take it,
+# and drop one if we are holding it (frees the slot for a laser or lightning).
+NO_MORTAR = True
+if NO_MORTAR:
+    base.WEAPON_RANK["mortar"] = -1
 # Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
 # 130 m, inside a drone's 1.8 m radius), and walk toward ones seen within 170 m.
 base.PARAMS.update({"farm_range": 130.0, "farm_seek_range": 170.0})
@@ -161,6 +167,15 @@ class Duelist(base.Bot):
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
 
+    def drop_mortar(self, obs, act: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop a held mortar (slot 1) unless this action already takes or drops something."""
+        if NO_MORTAR and "take" not in act and "drop" not in act:
+            ws = (obs.get("self") or {}).get("weapons") or [None, None]
+            w1 = ws[1] if len(ws) > 1 else None
+            if w1 and w1.get("kind") == "mortar":
+                act["drop"] = 1
+        return act
+
     def is_hunting(self, m, x, y, dm, frac, t) -> bool:
         """Is this mech after us? (attacked us lately, already our target, close, closing in, or weak)"""
         mid = int(m["id"])
@@ -260,7 +275,7 @@ class Duelist(base.Bot):
     # ------------------------------------------------------------------ decision
     def _act(self, obs: Dict[str, Any], t0: float) -> Dict[str, Any]:
         if self.ffa:
-            return base.Bot._act(self, obs, t0)
+            return self.drop_mortar(obs, base.Bot._act(self, obs, t0))
         me = obs["self"]
         t = obs["t"]
         x, y, z = me["pos"]
@@ -600,6 +615,7 @@ class Duelist(base.Bot):
             mv = [mv[0] * 0.998 / n, mv[1] * 0.998 / n]
         act.update(move=[round(mv[0], 3), round(mv[1], 3)], aim=[round(aim[0], 4), round(aim[1], 4)],
                    fire=fire, boost=bool(boost), jump=bool(jump))
+        self.drop_mortar(obs, act)
         self.mode = mode
         mf.draw.label(f"S {mode} hp{hp:.0f} th{n_threat} tg{self.tgt_id}")
         return act
