@@ -1,0 +1,448 @@
+"""Hackermen duelist: practice-squad play on top of the survivor base (base.py).
+
+Practice (house squad): the 15 house bots never hurt each other, so every point is a house bot that
+dies before us. The bot therefore takes fights instead of hiding, and makes each one lopsided:
+  - fight at the range our loadout wins (lightning close, laser far, gun middle) and strafe;
+  - one target at a time, stick to it, finish anything low;
+  - back off to cover only when actually losing (low HP or outnumbered), heal, come back;
+  - grab cubes and better weapons, even mid-fight when they are close;
+  - walk at full speed (quiet walking cost other teams 0.1-0.25 on the board).
+Free-for-all (the final), detected when a mech takes damage we did not deal: hand over to the
+survival-first base bot, which hides, heals and only finishes weakened enemies.
+"""
+from __future__ import annotations
+
+import math
+import os
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+import mechfight as mf
+import base
+from base import hyp, wrap
+
+# Laser first: hitscan to 280 m, and house guns rarely hit past ~100 m.
+base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
+
+DUEL = {
+    # preferred fight range by best weapon held (m), and the dead band around it
+    "range_lightning": 28.0,
+    "range_laser": 125.0,
+    "range_gun": 75.0,
+    "range_band": 15.0,
+    # retreat when losing: HP fraction thresholds by the number of mechs with a line of sight to us
+    "retreat_hp_1": 0.35,
+    "retreat_hp_2": 0.55,
+    "retreat_hp_3": 0.80,
+    # finish a target below this HP fraction even when we would otherwise retreat (if we are above 20%)
+    "finish_frac": 0.25,
+    # heal in place after a fight until this HP fraction, starting below heal_start
+    "heal_start": 0.60,
+    "heal_until": 0.90,
+    # strafe flip interval (s)
+    "strafe_min": 0.35,
+    "strafe_max": 1.05,
+    # mid-fight detours: cubes when healthy / hurt, a better weapon while gun-only / armed
+    "fight_cube_m": 70.0,
+    "fight_cube_hurt_m": 40.0,
+    "fight_weapon_gun_m": 60.0,
+    "fight_weapon_armed_m": 35.0,
+    # farm drones and crates above this HP fraction
+    "farm_hp": 0.45,
+    # chase a target that broke line of sight while we are at least this much healthier (fraction)
+    "chase_margin": 0.1,
+    "chase_range": 150.0,
+}
+
+UPGRADES = ["plating", "armor", "nanites", "laser_damage", "laser_charge", "gun_damage", "gun_rate",
+            "reactor", "lightning_efficiency", "lightning_range", "servos", "gyros", "sensors", "capacitor",
+            "gun_mag", "gun_velocity", "lightning_chain", "jets", "laser_pierce", "mortar_reload",
+            "mortar_splash", "mortar_velocity"]
+
+
+class Duelist(base.Bot):
+    name = "hackermen-duelist"
+
+    def __init__(self, hello: Dict[str, Any]) -> None:
+        super().__init__(hello)
+        self.tgt_id: Optional[int] = None
+        self.tgt_t = -99.0
+        self.strafe_sign = 1.0
+        self.strafe_next = 0.0
+        self.healing = False
+        self.dead: set = set()
+        self.goal_hist: List[Tuple[float, float]] = []
+
+    # ------------------------------------------------------------------ inputs
+    def ingest(self, obs, me, x, y, z, eye_h, t) -> None:
+        for e in obs.get("events") or []:
+            et = e.get("type")
+            if et == "damaged":
+                if e.get("weapon") != "zone":
+                    self.last_damage_t = t
+                    self.last_hostile_t = t
+                    if e.get("bearing") is not None:
+                        self.dmg_bearing = e["bearing"]
+                    if e.get("by") is None:
+                        self.last_dmg_anon_t = t
+                    else:
+                        self.attackers[int(e["by"])] = t
+                        self.dmg_by = e["by"]
+            elif et == "hit":
+                tg = e.get("target")
+                if isinstance(tg, int) and tg < 100:
+                    self.focus_id, self.focus_t = tg, t
+            elif et == "kill":
+                tg = e.get("target")
+                if isinstance(tg, int):
+                    self.attackers.pop(tg, None)
+                    self.mem_crate.pop(tg, None)
+                    if tg < 100:
+                        # forget the dead mech at once: its cubes are ours to collect, not a contested spot
+                        self.dead.add(tg)
+                        ml = self.mech_last.pop(tg, None)
+                        if ml is not None and t - ml[3] < 3.0:
+                            self.corpse = (ml[0], ml[1], ml[2], t)
+                    if tg == self.focus_id:
+                        self.focus_id = None
+                    if tg == self.tgt_id:
+                        self.tgt_id = None
+            elif et == "take_failed":
+                self.taken_fail[int(e.get("id", -1))] = t
+                if e.get("reason") == "gone":
+                    self.mem_pick.pop(int(e.get("id", -1)), None)
+            elif et == "took":
+                self.mem_pick.pop(int(e.get("id", -1)), None)
+        self.update_memory(obs, me, x, y, z, eye_h, t)
+        for k in self.dead:
+            self.mech_last.pop(k, None)
+        for s in obs.get("sounds") or []:
+            if s.get("kind") in base.HOSTILE_SOUNDS and s.get("age", 0) < 1.0 and "bearing" in s:
+                dd = base.SOUND_DIST.get(s.get("dist"), 110.0)
+                b = s["bearing"]
+                self.pseudo.append((x + dd * math.cos(b), y + dd * math.sin(b), 0.6, t))
+        self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
+        self.detect_ffa(obs, t)
+
+    # ------------------------------------------------------------------ decision
+    def _act(self, obs: Dict[str, Any], t0: float) -> Dict[str, Any]:
+        if self.ffa:
+            return base.Bot._act(self, obs, t0)
+        me = obs["self"]
+        t = obs["t"]
+        x, y, z = me["pos"]
+        vx, vy = me["vel"][0], me["vel"][1]
+        hp, mhp = me["hp"], max(1.0, me["max_hp"])
+        hpf = hp / mhp
+        stats = me.get("stats") or {}
+        eye_h = stats.get("eye_height", 8.0)
+        muz_h = stats.get("muzzle_height", 7.0)
+        energy = me.get("energy", 0.0) or 0.0
+        W = self.world
+        act: Dict[str, Any] = {}
+        self.ingest(obs, me, x, y, z, eye_h, t)
+
+        off = obs.get("offer")
+        if off and off.get("choices"):
+            ranks = [UPGRADES.index(c.get("id")) if c.get("id") in UPGRADES else 99 for c in off["choices"]]
+            act["pick"] = ranks.index(min(ranks))
+
+        weapons = me.get("weapons") or [None, None]
+        kinds = [w.get("kind") for w in weapons if w]
+        my_id = me.get("id")
+        enemies = [m for m in obs.get("mechs") or []
+                   if m.get("kind") == "mech" and m.get("id") != my_id and m.get("id") not in self.dead]
+        npcs = [m for m in obs.get("mechs") or [] if m.get("kind") == "npc"]
+        enemies.sort(key=lambda m: hyp(x, y, m["pos"][0], m["pos"][1]))
+        if enemies:
+            self.last_hostile_t = t
+
+        # who can shoot us right now (line of sight from their eye to our body)
+        shooters = []
+        for m in enemies[:6]:
+            mx, my_, mz = m["pos"]
+            dm = math.dist((x, y, z), (mx, my_, mz))
+            if dm > 285:
+                continue
+            if W and W.sight_blocked((mx, my_, mz + eye_h), (x, y, z + 4.5)) and \
+                    W.sight_blocked((mx, my_, mz + eye_h), (x, y, z + 8.5)):
+                continue
+            shooters.append((m, dm))
+        n_threat = len([1 for (m, dm) in shooters if dm < 200 or t - self.attackers.get(int(m["id"]), -99) < 3])
+
+        # ---- target: one mech at a time, sticky, weakest and closest first, attackers first
+        target, best = None, 1e9
+        for m in enemies[:6]:
+            mx, my_, mz = m["pos"]
+            dm = math.dist((x, y, z), (mx, my_, mz))
+            if dm > 280:
+                continue
+            if W and W.sight_blocked((x, y, z + muz_h), (mx, my_, mz + 4.0)):
+                continue
+            mid = int(m["id"])
+            frac = (m.get("hp") or 1400.0) / max(1.0, m.get("max_hp") or 1400.0)
+            friends = sum(1 for o in enemies if o is not m and hyp(o["pos"][0], o["pos"][1], mx, my_) < 40)
+            cost = dm + 120.0 * frac + 25.0 * friends
+            if t - self.attackers.get(mid, -99) < 3.0:
+                cost -= 50.0
+            if mid == self.tgt_id and t - self.tgt_t < 2.0:
+                cost -= 40.0
+            if cost < best:
+                best, target = cost, m
+        if target is not None:
+            if int(target["id"]) != self.tgt_id:
+                self.tgt_id = int(target["id"])
+            self.tgt_t = t
+        tfrac = None
+        if target is not None:
+            tfrac = (target.get("hp") or 1400.0) / max(1.0, target.get("max_hp") or 1400.0)
+
+        # ---- losing? (retreat to cover, keep shooting back)
+        retreat = False
+        if n_threat >= 3 and hpf < DUEL["retreat_hp_3"]:
+            retreat = True
+        elif n_threat >= 2 and hpf < DUEL["retreat_hp_2"]:
+            retreat = True
+        elif hpf < DUEL["retreat_hp_1"] and (tfrac is None or hpf < tfrac + 0.1):
+            retreat = True
+        finishing = target is not None and tfrac is not None and tfrac < DUEL["finish_frac"] and hpf > 0.2 \
+            and n_threat <= 2
+        if finishing:
+            retreat = False
+
+        # ---- heal after fights (regen 45 HP/s starts 5 s after the last damage dealt or taken)
+        quiet = not enemies and t - self.last_damage_t > 3.0
+        if quiet and hpf < DUEL["heal_start"]:
+            self.healing = True
+        if hpf >= DUEL["heal_until"] or (enemies and hpf >= 0.5):
+            self.healing = False
+
+        # ---- zone timing
+        zone = obs["zone"]
+        zgx, zgy, _ = self.zone_goal(obs, x, y)
+        zdist = hyp(x, y, zgx, zgy)
+        cx, cy, cr = zone["center"][0], zone["center"][1], zone["radius"]
+        out_now = not me.get("in_zone", True) or hyp(cx, cy, x, y) > cr
+        edge_t = self.edge_time(zone, x, y, t)
+        time_left = max(1.0, min(zone["shrink_end"], edge_t) - t - 8.0)
+        need_speed = zdist * 1.3 / time_left
+        zone_urgent = out_now or need_speed > 0.6 * self.walk or (zone["shrink_start"] - t < 12 and zdist > 5)
+
+        threats = [(m["pos"][0], m["pos"][1], m["pos"][2], 2.0) for m in enemies[:4]]
+        threats += [(p[0], p[1], W.ground_at(p[0], p[1]) if W else z, p[2]) for p in self.pseudo[-4:]]
+
+        goal: Optional[Tuple[float, float]] = None
+        boost = False
+        hold = False          # fighting in place: strafe only
+        mode = "travel"
+        if zone_urgent and (out_now or zdist > 8):
+            goal, mode = (zgx, zgy), "zone"
+            boost = out_now and energy > 20
+        elif retreat and threats:
+            if W and (self.cover is None or t - self.cover_t > 0.5):
+                self.choose_cover(obs, x, y, z, threats, t)
+            if self.cover is not None and hyp(x, y, *self.cover) > 2.0:
+                goal, mode = self.cover, "retreat"
+                boost = hpf < 0.5 and energy > 30 and hyp(x, y, *self.cover) > 10
+            else:
+                hold, mode = True, "retreat-hold"
+        elif target is not None:
+            mode = "fight"
+            d = hyp(x, y, target["pos"][0], target["pos"][1])
+            if "lightning" in kinds and energy > 25:
+                pref = DUEL["range_lightning"]
+            elif "laser" in kinds:
+                pref = DUEL["range_laser"]
+            else:
+                pref = DUEL["range_gun"]
+            if finishing and pref > 50:
+                pref = 50.0
+            band = DUEL["range_band"]
+            if d > pref + band:
+                goal = (target["pos"][0], target["pos"][1])
+                mode = "fight-close"
+            elif d < pref - band:
+                ax, ay = (x - target["pos"][0]) / max(d, 1e-3), (y - target["pos"][1]) / max(d, 1e-3)
+                bx, by = x + 20 * ax, y + 20 * ay
+                if W is None or (W.walkable(bx, by) and self.safe_point(obs, bx, by, t) < 1):
+                    goal = (bx, by)
+                    mode = "fight-back"
+                else:
+                    hold = True
+            else:
+                hold = True
+            # a close cube or a better weapon is worth the detour while we keep shooting
+            gun_only = not any(k in ("laser", "lightning") for k in kinds)
+            wmax = DUEL["fight_weapon_gun_m"] if gun_only else DUEL["fight_weapon_armed_m"]
+            fa = self.econ_goal(obs, me, x, y, z, t, act, False, wmax=wmax, weapons_only=True)
+            if fa is None:
+                cr_save = base.PARAMS["cube_range"]
+                base.PARAMS["cube_range"] = DUEL["fight_cube_m"] if hpf > 0.5 else DUEL["fight_cube_hurt_m"]
+                try:
+                    fa = self.econ_goal(obs, me, x, y, z, t, act, False, wmax=0.0)
+                finally:
+                    base.PARAMS["cube_range"] = cr_save
+            if fa is not None:
+                goal, hold, mode = fa[0], False, "fight-" + fa[1]
+        elif self.healing:
+            mode = "heal"
+            if threats and W:
+                if self.cover is None or t - self.cover_t > 1.0:
+                    self.choose_cover(obs, x, y, z, threats, t)
+                if self.cover is not None and hyp(x, y, *self.cover) > 2.0:
+                    goal = self.cover
+        else:
+            chase = None
+            if self.focus_id is not None and t - self.focus_t < 6.0 and t < self.endgame_t:
+                for m in enemies:
+                    if int(m["id"]) == self.focus_id:
+                        fr = (m.get("hp") or 1400.0) / max(1.0, m.get("max_hp") or 1400.0)
+                        if fr + DUEL["chase_margin"] < hpf and hyp(x, y, m["pos"][0], m["pos"][1]) < DUEL["chase_range"]:
+                            chase = m
+                        break
+            if chase is not None:
+                goal, mode = (chase["pos"][0], chase["pos"][1]), "chase"
+                target = chase
+            else:
+                econ = None
+                if hpf >= 0.4 and t < self.T["final_center_t"]:
+                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8)
+                if econ is not None:
+                    goal, mode = econ
+                else:
+                    fg = None
+                    if hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk:
+                        fg = self.farm_seek(obs, x, y, z)
+                    if fg is not None:
+                        goal, mode = fg, "farm-seek"
+                    elif zdist > 3:
+                        goal, mode = (zgx, zgy), "travel"
+                    else:
+                        mode = "camp"
+
+        # ---- movement vector
+        mv = [0.0, 0.0]
+        gdir = None
+        if goal is not None:
+            mv = self.steer(x, y, goal, t, me)
+            n = math.hypot(*mv)
+            if n > 0:
+                gdir = (mv[0] / n, mv[1] / n)
+                mv = list(gdir)
+            if hyp(x, y, *goal) < 2.0:
+                mv, gdir = [0.0, 0.0], None
+        # strafe across the line of fire of the nearest shooter (or the target) while in a fight
+        fight_ref = target if target is not None else (shooters[0][0] if shooters else None)
+        strafing = False
+        if fight_ref is not None and mode not in ("zone",) and target is not None and target.get("kind") == "mech":
+            if t >= self.strafe_next:
+                self.strafe_sign = -self.strafe_sign
+                self.strafe_next = t + self.rng.uniform(DUEL["strafe_min"], DUEL["strafe_max"])
+            b = math.atan2(fight_ref["pos"][1] - y, fight_ref["pos"][0] - x)
+            px, py = -math.sin(b) * self.strafe_sign, math.cos(b) * self.strafe_sign
+            if W is not None and not W.line_clear(x, y, x + 6 * px, y + 6 * py):
+                self.strafe_sign = -self.strafe_sign
+                px, py = -px, -py
+            if gdir is None:
+                mv = [px, py]
+            else:
+                dp = px * gdir[0] + py * gdir[1]
+                if dp < 0:
+                    px, py = px - dp * gdir[0], py - dp * gdir[1]
+                mv = [gdir[0] * 0.7 + px * 0.7, gdir[1] * 0.7 + py * 0.7]
+            strafing = True
+            # a laser charging at us: boost sideways (hitscan, can't be outrun, but can be out-strafed)
+            for m in enemies:
+                if m.get("charging") and m.get("aim"):
+                    ma = m["aim"][0]
+                    dm = hyp(x, y, m["pos"][0], m["pos"][1])
+                    if abs(wrap(math.atan2(y - m["pos"][1], x - m["pos"][0]) - ma)) < math.atan2(self.radius, max(1.0, dm)) + 0.15:
+                        if energy > 25 and me.get("grounded", True):
+                            boost = True
+                        break
+        dodge = self.mortar_dodge(obs, x, y, z, vx, vy, t)
+        if dodge is not None:
+            mv = list(dodge)
+            boost = energy > 10 and me.get("grounded", True)
+            mode = "dodge"
+        n = math.hypot(*mv)
+        if n > 1e-6:
+            mv = [mv[0] / n, mv[1] / n]
+
+        # ---- stuck: only judged while walking to a goal (not while strafing in place or charging)
+        jump = False
+        charging = any(w and w.get("kind") == "laser" and (w.get("charge") or 0) > 0 for w in weapons)
+        if goal is not None and not strafing and not charging and mode != "dodge":
+            self.goal_hist.append((x, y))
+            del self.goal_hist[:-11]
+            if len(self.goal_hist) == 11 and hyp(self.goal_hist[0][0], self.goal_hist[0][1], x, y) < 1.5:
+                self.stuck_n += 1
+            else:
+                self.stuck_n = max(0, self.stuck_n - 1)
+        else:
+            self.goal_hist.clear()
+            self.stuck_n = 0
+        if self.stuck_n >= 5 and t > self.unstick_until + 1.0:
+            self.unstick_until = t + 1.2
+            self.unstick_dir = -self.unstick_dir
+            self.stuck_n = 0
+            self.planner, self.path, self.plan_t = None, None, -99
+        if t < self.climb_until and goal is not None and not charging:
+            if me.get("grounded", True):
+                jump = True
+            boost = energy > 10
+        elif t < self.unstick_until and goal is not None:
+            if me.get("grounded", True):
+                jump = True
+            boost = energy > 15
+            px, py = -mv[1], mv[0]
+            mv = [mv[0] + 0.5 * self.unstick_dir * px, mv[1] + 0.5 * self.unstick_dir * py]
+            n = math.hypot(*mv) or 1.0
+            mv = [mv[0] / n, mv[1] / n]
+
+        # ---- aim and fire
+        fire = [False, False]
+        aim = None
+        shoot_at = target
+        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies:
+            shoot_at = self.farm_target(obs, x, y, z, muz_h)
+        if shoot_at is None:
+            # drones shooting us
+            for nn in npcs:
+                if t - self.attackers.get(int(nn["id"]), -99) < 3.0:
+                    shoot_at = nn
+                    break
+        if shoot_at is not None:
+            aim, fire = self.fire_control(me, shoot_at, weapons, x, y, z, muz_h)
+            if mode == "heal" and shoot_at.get("kind") != "mech":
+                fire = [False, False]  # dealing damage restarts the regen clock
+        if aim is None:
+            aim = self.scan_aim(obs, x, y, t, mv, threats)
+        g0 = weapons[0] if weapons else None
+        if g0 and g0.get("kind") == "gun" and not g0.get("reload"):
+            ammo = g0.get("ammo", 12)
+            if ammo == 0 or (shoot_at is None and ammo < 8):
+                act["reload"] = True
+
+        self.last_aim = aim
+        n = math.hypot(*mv)
+        if n > 0.998:
+            mv = [mv[0] * 0.998 / n, mv[1] * 0.998 / n]
+        act.update(move=[round(mv[0], 3), round(mv[1], 3)], aim=[round(aim[0], 4), round(aim[1], 4)],
+                   fire=fire, boost=bool(boost), jump=bool(jump))
+        self.mode = mode
+        mf.draw.label(f"S {mode} hp{hp:.0f} th{n_threat} tg{self.tgt_id}")
+        return act
+
+
+Bot = Duelist  # the name the kit wrapper and our simulator look for
+
+if __name__ == "__main__":
+    try:
+        mf.run(Duelist)
+    finally:
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(0)
