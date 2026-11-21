@@ -26,6 +26,9 @@ base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
 # Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
 # 130 m, inside a drone's 1.8 m radius), and walk toward ones seen within 170 m.
 base.PARAMS.update({"farm_range": 130.0, "farm_seek_range": 170.0})
+# Arm up: 9 of 20 real-server deaths came with only a gun (or gun + mortar). After the opening, still go
+# for a laser or lightning remembered within 300 m (was 150 m).
+base.PARAMS["arm_late_range"] = 300.0
 # Free-for-all switch: one "a mech lost HP and it was not us" event also happens in practice (drones,
 # splash), and the squad simulator flipped 5 of 48 practice matches into hiding on it. Ask for three.
 base.PARAMS["ffa_ev_needed"] = 3
@@ -53,7 +56,7 @@ DUEL = {
     # mid-fight detours: cubes when healthy / hurt, a better weapon while gun-only / armed
     "fight_cube_m": 70.0,
     "fight_cube_hurt_m": 40.0,
-    "fight_weapon_gun_m": 60.0,
+    "fight_weapon_gun_m": 120.0,
     "fight_weapon_armed_m": 35.0,
     # farm drones and crates above this HP fraction
     "farm_hp": 0.45,
