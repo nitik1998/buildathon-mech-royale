@@ -39,9 +39,9 @@ DUEL = {
     "range_gun": 75.0,
     "range_band": 15.0,
     # retreat when losing: HP fraction thresholds by the number of mechs with a line of sight to us
-    "retreat_hp_1": 0.50,
-    "retreat_hp_2": 0.70,
-    "retreat_hp_3": 0.90,
+    "retreat_hp_1": 0.35,
+    "retreat_hp_2": 0.55,
+    "retreat_hp_3": 0.80,
     # finish a target below this HP fraction even when we would otherwise retreat (if we are above 20%)
     "finish_frac": 0.25,
     # heal in place after a fight until this HP fraction, starting below heal_start
