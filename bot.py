@@ -87,6 +87,10 @@ DUEL = {
     "target_mode": "frac",
     # explore instead of idling: walk to unvisited spots inside the next circle (cells of explore_cell_m)
     "explore": True,
+    # match type: opening profile until squad_t; a foreign mech death before ffa_death_until = free-for-all
+    "squad_t": 30.0,
+    "ffa_death_until": 120.0,
+    "opening_arm_m": 150.0,
     # v17 candidates: focus the lowest-HP shooter when 2+ shoot at us; fight from a spot only the target sees
     "multi_focus": False,
     # full-strength theme: upgrade order ("plating_first" = v13), keep healing with only non-hunters in
@@ -132,6 +136,11 @@ class Duelist(base.Bot):
         self.spot: Optional[Tuple[float, float]] = None
         self.spot_t = -99.0
         self.visited: Dict[Tuple[int, int], int] = {}
+        # match-type detection: mech deaths we did not cause mean a free-for-all
+        self.alive0: Optional[int] = None
+        self.my_mech_kills = 0
+        self.foreign_since: Optional[float] = None
+        self.opening = True
         self.explore_wp: Optional[Tuple[float, float]] = None
         self.explore_t = -99.0
 
@@ -160,6 +169,7 @@ class Duelist(base.Bot):
                     self.attackers.pop(tg, None)
                     self.mem_crate.pop(tg, None)
                     if tg < 100:
+                        self.my_mech_kills += 1
                         # forget the dead mech at once: its cubes are ours to collect, not a contested spot
                         self.dead.add(tg)
                         ml = self.mech_last.pop(tg, None)
@@ -185,6 +195,25 @@ class Duelist(base.Bot):
                 self.pseudo.append((x + dd * math.cos(b), y + dd * math.sin(b), 0.6, t))
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
+        # One mech death we did not cause settles it: in practice the house squad never hurts itself, and
+        # the zone cannot kill a 1400 HP mech this early. Measured on 210 real free-for-alls: the first death
+        # comes by 25 s in 93% of matches and by 30 s in 98%.
+        alive = obs.get("alive")
+        if isinstance(alive, int):
+            if self.alive0 is None:
+                self.alive0 = alive
+            foreign = (self.alive0 - alive) - self.my_mech_kills
+            if foreign > 0 and t < DUEL["ffa_death_until"]:
+                if self.foreign_since is None:
+                    self.foreign_since = t
+                elif t - self.foreign_since >= 0.5 and not self.ffa:
+                    self.ffa = True
+                    mf.log(f"free-for-all: {foreign} death(s) we did not cause by t={t:.1f}")
+            else:
+                self.foreign_since = None
+        # Until squad_t with no such death the match type is unknown: play the opening (no first shots,
+        # no noisy farming, short trips only). After squad_t with no foreign death it is the practice squad.
+        self.opening = (not self.ffa) and t < DUEL["squad_t"]
 
     def drop_mortar(self, obs, act: Dict[str, Any]) -> Dict[str, Any]:
         """Drop a held mortar (slot 1) unless this action already takes or drops something."""
@@ -231,7 +260,11 @@ class Duelist(base.Bot):
         mid = int(m["id"])
         if t - self.attackers.get(mid, -99) < DUEL["hunt_recent_s"] or (mid == self.tgt_id and t - self.tgt_t < 3.0):
             return True
-        if dm < DUEL["hunt_close_m"] or frac < DUEL["hunt_low_frac"]:
+        if dm < DUEL["hunt_close_m"]:
+            return True
+        if self.opening:
+            return False  # match type unknown: never fire first at range
+        if frac < DUEL["hunt_low_frac"]:
             return True
         v = m.get("vel") or [0.0, 0.0, 0.0]
         d = max(1.0, hyp(x, y, m["pos"][0], m["pos"][1]))
@@ -569,9 +602,18 @@ class Duelist(base.Bot):
                 if dg is not None:
                     econ = (dg, "drop")
                 elif hpf >= 0.4 and t < self.T["final_center_t"]:
-                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8)
+                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8,
+                                          wmax=(DUEL["opening_arm_m"] if self.opening else None))
                 if econ is not None:
                     goal, mode = econ
+                elif self.opening:
+                    # nothing worth a short trip: stay out of sight of any mech we can see, else hold still
+                    mode = "open-hold"
+                    if enemies and W is not None:
+                        if self.cover is None or t - self.cover_t > 1.0:
+                            self.choose_cover(obs, x, y, z, threats, t)
+                        if self.cover is not None and hyp(x, y, *self.cover) > 2.0:
+                            goal, mode = self.cover, "open-hide"
                 else:
                     fg = None
                     if hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk:
@@ -672,7 +714,7 @@ class Duelist(base.Bot):
         fire = [False, False]
         aim = None
         shoot_at = target
-        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies:
+        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies and not self.opening:
             shoot_at = self.farm_target(obs, x, y, z, muz_h)
         if shoot_at is None:
             # drones shooting us
