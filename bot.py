@@ -52,7 +52,15 @@ DUEL = {
     # chase a target that broke line of sight while we are at least this much healthier (fraction)
     "chase_margin": 0.1,
     "chase_range": 150.0,
+    # supply drops: take one within drop_range when nothing hostile for drop_quiet_s and no mech known
+    # within drop_clear_m of it
+    "drops": True,
+    "drop_range": 220.0,
+    "drop_quiet_s": 6.0,
+    "drop_clear_m": 100.0,
 }
+
+PARAMS = DUEL  # simulator overrides ("bot+key=value") land here
 
 UPGRADES = ["plating", "armor", "nanites", "laser_damage", "laser_charge", "gun_damage", "gun_rate",
             "reactor", "lightning_efficiency", "lightning_range", "servos", "gyros", "sensors", "capacitor",
@@ -123,6 +131,33 @@ class Duelist(base.Bot):
                 self.pseudo.append((x + dd * math.cos(b), y + dd * math.sin(b), 0.6, t))
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
+
+    def drop_goal(self, obs, x, y, t, me_id) -> Optional[Tuple[float, float]]:
+        """The nearest supply drop worth taking: in range, landed or landing by the time we arrive, inside
+        the zone a while longer, not held by another mech, no mech known near it, nothing hostile lately.
+        Standing alone in its ring for capture_s gives +3 cubes, full HP and full energy."""
+        if t - self.last_hostile_t < DUEL["drop_quiet_s"]:
+            return None
+        known = self.known_mechs(t, me_id)
+        best, bd = None, DUEL["drop_range"]
+        for d in obs.get("drops") or []:
+            try:
+                px, py = d["pos"][0], d["pos"][1]
+            except Exception:
+                continue
+            holder = d.get("holder")
+            if holder is not None and holder != -1 and holder != me_id:
+                continue
+            dist = hyp(x, y, px, py)
+            lands = d.get("lands_in") or 0.0
+            if dist > bd or lands > dist / max(1.0, self.walk) + 3.0:
+                continue
+            if self.safe_point(obs, px, py, t + max(lands, 0.0) + 6.0) >= 1:
+                continue
+            if any(hyp(kx, ky, px, py) < DUEL["drop_clear_m"] for kx, ky in known):
+                continue
+            best, bd = (px, py), dist
+        return best
 
     # ------------------------------------------------------------------ decision
     def _act(self, obs: Dict[str, Any], t0: float) -> Dict[str, Any]:
@@ -305,7 +340,11 @@ class Duelist(base.Bot):
                 target = chase
             else:
                 econ = None
-                if hpf >= 0.4 and t < self.T["final_center_t"]:
+                # a supply drop is +3 cubes and a full heal, so it is not gated on HP
+                dg = self.drop_goal(obs, x, y, t, my_id) if DUEL["drops"] and not zone_urgent else None
+                if dg is not None:
+                    econ = (dg, "drop")
+                elif hpf >= 0.4 and t < self.T["final_center_t"]:
                     econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8)
                 if econ is not None:
                     goal, mode = econ
