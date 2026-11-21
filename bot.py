@@ -21,8 +21,10 @@ import mechfight as mf
 import base
 from base import hyp, wrap
 
-# Laser first: hitscan to 280 m, and house guns rarely hit past ~100 m.
-base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
+# Weapon preference for pickups (v1-v13 had laser 3, lightning 2).
+base.WEAPON_RANK.update({"laser": 2, "lightning": 3, "mortar": 1, "gun": 0})
+# v14: lightning first. Real-server recordings: our lightning hits 97% of shots (~240 dmg/s inside 45 m)
+# and cancels an enemy laser charge ("short"); house bots fired 3,500+ laser shots in those matches.
 # No mortar: real-server recordings show 0 hits in 9 shots, v9 held one 15% of the time, and a mech
 # holding a mortar takes +60% from lasers (cook-off). Rank it below an empty slot so we never take it,
 # and drop one if we are holding it (frees the slot for a laser or lightning).
