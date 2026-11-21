@@ -27,7 +27,7 @@ base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
 # holding a mortar takes +60% from lasers (cook-off). Rank it below an empty slot so we never take it,
 # and drop one if we are holding it (frees the slot for a laser or lightning).
 NO_MORTAR = True
-RNG_SALT = 2
+RNG_SALT = 6
 if NO_MORTAR:
     base.WEAPON_RANK["mortar"] = -1
 # Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
@@ -99,7 +99,7 @@ DUEL = {
     "ffa_death": True,
     "ffa_death_until": 100.0,
     # sidestep visible gun bullets: in the squad loop / on top of the base bot in a free-for-all
-    "sq_dodge": False,
+    "sq_dodge": True,
     "ffa_dodge": False,
     "dodge_margin": 0.3,
     "dodge_horizon_s": 1.0,
