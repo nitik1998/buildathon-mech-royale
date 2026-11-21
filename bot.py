@@ -27,6 +27,7 @@ base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
 # holding a mortar takes +60% from lasers (cook-off). Rank it below an empty slot so we never take it,
 # and drop one if we are holding it (frees the slot for a laser or lightning).
 NO_MORTAR = True
+RNG_SALT = 0
 if NO_MORTAR:
     base.WEAPON_RANK["mortar"] = -1
 # Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
@@ -85,7 +86,7 @@ DUEL = {
     # "frac" = distance + HP fraction (v1-v9)
     "target_mode": "frac",
     # explore instead of idling: walk to unvisited spots inside the next circle (cells of explore_cell_m)
-    "explore": False,
+    "explore": True,
     "explore_cell_m": 50.0,
     # last stand: when we would retreat but this many enemies are already within 150 m, retreating rarely
     # saves us (we die with our back turned); fight the weakest instead (99 = off)
@@ -105,6 +106,8 @@ class Duelist(base.Bot):
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         super().__init__(hello)
+        # RNG salt: identical logic, different random stream per submitted copy (board-noise sampling)
+        self.rng.seed((hello.get("seed") or 0) + RNG_SALT)
         self.tgt_id: Optional[int] = None
         self.tgt_t = -99.0
         self.strafe_sign = 1.0
