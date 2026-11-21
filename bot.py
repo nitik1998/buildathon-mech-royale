@@ -99,6 +99,8 @@ class Duelist(base.Bot):
 
     def __init__(self, hello: Dict[str, Any]) -> None:
         super().__init__(hello)
+        # null-change probe: same logic, different random stream (measures board noise)
+        self.rng.seed((hello.get("seed") or 0) + 7919)
         self.tgt_id: Optional[int] = None
         self.tgt_t = -99.0
         self.strafe_sign = 1.0
