@@ -87,6 +87,22 @@ DUEL = {
     "target_mode": "frac",
     # explore instead of idling: walk to unvisited spots inside the next circle (cells of explore_cell_m)
     "explore": True,
+    # free-for-all profile ("own" = below, "base" = the survivor base bot)
+    "ffa_profile": "own",
+    "ffa_late_t": 130.0,       # from here (or with ffa_late_alive mechs left) take fights we are favoured in
+    "ffa_late_alive": 6,
+    "ffa_hide_m": 220.0,       # break line of sight to any mech that can see us within this range
+    "ffa_self_m": 50.0,        # a mech this close is fought
+    "ffa_engage_m": 150.0,     # weak / wounded / late-game targets only inside this range
+    "ffa_weak_frac": 0.35,
+    "ffa_vulture_frac": 0.70,  # a mech someone else damaged in the last 5 s, below this HP fraction
+    "ffa_adv": 0.90,           # late fights need our HP x damage >= this x theirs
+    "ffa_retreat_hp_1": 0.40,
+    "ffa_heal_start": 0.80,
+    "ffa_heal_until": 0.95,
+    "ffa_farm_stop": 150.0,
+    "ffa_arm_m": 250.0,
+    "farm_clear_m": 200.0,     # farm only with no known mech this close (opening and free-for-all)
     # sidestep visible bullets (off = random strafing only)
     "bullet_dodge": False,
     "dodge_margin": 0.3,
@@ -145,6 +161,9 @@ class Duelist(base.Bot):
         self.my_mech_kills = 0
         self.foreign_since: Optional[float] = None
         self.opening = True
+        self.my_hits: Dict[int, float] = {}       # mech id -> last time we hit it
+        self.hp_seen: Dict[int, Tuple[float, float]] = {}
+        self.third_dmg: Dict[int, float] = {}     # mech id -> last time someone else damaged it
         self.explore_wp: Optional[Tuple[float, float]] = None
         self.explore_t = -99.0
 
@@ -167,6 +186,7 @@ class Duelist(base.Bot):
                 tg = e.get("target")
                 if isinstance(tg, int) and tg < 100:
                     self.focus_id, self.focus_t = tg, t
+                    self.my_hits[tg] = t
             elif et == "kill":
                 tg = e.get("target")
                 if isinstance(tg, int):
@@ -199,6 +219,15 @@ class Duelist(base.Bot):
                 self.pseudo.append((x + dd * math.cos(b), y + dd * math.sin(b), 0.6, t))
         self.pseudo = [p for p in self.pseudo if t - p[3] < 6.0][-12:]
         self.detect_ffa(obs, t)
+        my_id = me.get("id")
+        for m in obs.get("mechs") or []:
+            if m.get("kind") != "mech" or m.get("id") == my_id or m.get("hp") is None:
+                continue
+            mid = int(m["id"])
+            prev = self.hp_seen.get(mid)
+            if prev is not None and t - prev[1] < 0.35 and prev[0] - m["hp"] > 15 and t - self.my_hits.get(mid, -99) > 0.5:
+                self.third_dmg[mid] = t
+            self.hp_seen[mid] = (m["hp"], t)
         # One mech death we did not cause settles it: in practice the house squad never hurts itself, and
         # the zone cannot kill a 1400 HP mech this early. Measured on 210 real free-for-alls: the first death
         # comes by 25 s in 93% of matches and by 30 s in 98%.
@@ -332,6 +361,34 @@ class Duelist(base.Bot):
                 bk, best = key, [cx, cy]
         return best
 
+    def ffa_target_ok(self, m, x, y, dm, frac, t, late, alive_n, enemies, hp, my_mult) -> bool:
+        """Free-for-all: whom may we fight? Attackers, mechs on top of us, a laser charging at us, the weak,
+        the wounded leaving someone else's fight, and (late) lone mechs we are favoured against."""
+        mid = int(m["id"])
+        if alive_n <= 2:
+            return True
+        if t - self.attackers.get(mid, -99) < DUEL["hunt_recent_s"] or (mid == self.tgt_id and t - self.tgt_t < 3.0):
+            return True
+        if dm < DUEL["ffa_self_m"]:
+            return True
+        if m.get("charging") and m.get("aim"):
+            off = abs(wrap(math.atan2(y - m["pos"][1], x - m["pos"][0]) - m["aim"][0]))
+            if off < math.atan2(self.radius, max(1.0, dm)) + 0.12:
+                return True
+        if dm > DUEL["ffa_engage_m"]:
+            return False
+        if frac < DUEL["ffa_weak_frac"]:
+            return True
+        if frac < DUEL["ffa_vulture_frac"] and t - self.third_dmg.get(mid, -99) < 5.0:
+            return True
+        if late and dm < 130.0:
+            mx, my_ = m["pos"][0], m["pos"][1]
+            if not any(o is not m and hyp(o["pos"][0], o["pos"][1], mx, my_) < 100.0 for o in enemies):
+                theirs = (m.get("hp") or 1400.0) * (1.0 + 0.04 * min(m.get("cubes") or 0, 10))
+                if hp * my_mult >= DUEL["ffa_adv"] * theirs:
+                    return True
+        return False
+
     def is_hunting(self, m, x, y, dm, frac, t) -> bool:
         """Is this mech after us? (attacked us lately, already our target, close, closing in, or weak)"""
         mid = int(m["id"])
@@ -434,8 +491,23 @@ class Duelist(base.Bot):
 
     # ------------------------------------------------------------------ decision
     def _act(self, obs: Dict[str, Any], t0: float) -> Dict[str, Any]:
-        if self.ffa:
-            return self.drop_mortar(obs, base.Bot._act(self, obs, t0))
+        if self.ffa and DUEL["ffa_profile"] != "own":
+            # "base": the survivor base bot plays the free-for-all. "hybrid": the same, except that while
+            # nobody is near (no known mech within farm_clear_m, no damage for 8 s, healthy, early) our own
+            # loop runs and farms drones, crates, cubes and weapons the way the best exhibition bot does.
+            use_base = True
+            if DUEL["ffa_profile"] == "hybrid":
+                me0 = obs["self"]
+                x0, y0 = me0["pos"][0], me0["pos"][1]
+                near = any(m.get("kind") == "mech" and m.get("id") != me0.get("id")
+                           and hyp(x0, y0, m["pos"][0], m["pos"][1]) < DUEL["farm_clear_m"]
+                           for m in obs.get("mechs") or [])
+                if not near and obs["t"] < DUEL["ffa_farm_stop"] and obs["t"] - self.last_damage_t > 8.0 \
+                        and me0["hp"] >= 0.6 * max(1.0, me0["max_hp"]):
+                    use_base = False
+            if use_base:
+                return self.drop_mortar(obs, base.Bot._act(self, obs, t0))
+        ffa = self.ffa
         me = obs["self"]
         t = obs["t"]
         x, y, z = me["pos"]
@@ -486,6 +558,9 @@ class Duelist(base.Bot):
 
         my_mult = 1.0 + 0.04 * min(me.get("cubes", 0) or 0, 10)
         my_speed = math.hypot(vx, vy)
+        alive_n = obs.get("alive") if isinstance(obs.get("alive"), int) else 16
+        late = ffa and (t >= DUEL["ffa_late_t"] or alive_n <= DUEL["ffa_late_alive"])
+        cautious = ffa or self.opening
         # ---- target: one mech at a time, sticky, weakest and closest first, attackers first
         target, best = None, 1e9
         for m in enemies[:6]:
@@ -497,7 +572,10 @@ class Duelist(base.Bot):
                 continue
             mid = int(m["id"])
             frac = (m.get("hp") or 1400.0) / max(1.0, m.get("max_hp") or 1400.0)
-            if DUEL["only_hunters"] and not self.is_hunting(m, x, y, dm, frac, t):
+            if ffa:
+                if not self.ffa_target_ok(m, x, y, dm, frac, t, late, alive_n, enemies, hp, my_mult):
+                    continue
+            elif DUEL["only_hunters"] and not self.is_hunting(m, x, y, dm, frac, t):
                 continue  # a house bot we damage joins the hunt: leave the ones not after us alone
             friends = sum(1 for o in enemies if o is not m and hyp(o["pos"][0], o["pos"][1], mx, my_) < 40)
             if DUEL["target_mode"] == "cost":
@@ -544,7 +622,13 @@ class Duelist(base.Bot):
 
         # ---- losing? (retreat to cover, keep shooting back)
         retreat = False
-        if n_threat >= 3 and hpf < DUEL["retreat_hp_3"]:
+        if ffa:
+            # free-for-all: never stay where two mechs can shoot us; leave a losing duel early
+            if n_threat >= 2 and alive_n > 2:
+                retreat = True
+            elif hpf < DUEL["ffa_retreat_hp_1"] and (tfrac is None or hpf < tfrac + 0.1):
+                retreat = True
+        elif n_threat >= 3 and hpf < DUEL["retreat_hp_3"]:
             retreat = True
         elif n_threat >= 2 and hpf < DUEL["retreat_hp_2"]:
             retreat = True
@@ -566,14 +650,16 @@ class Duelist(base.Bot):
 
         # ---- heal after fights (regen 45 HP/s starts 5 s after the last damage dealt or taken)
         quiet = not enemies and t - self.last_damage_t > 3.0
-        if quiet and hpf < DUEL["heal_start"]:
+        heal_start = DUEL["ffa_heal_start"] if ffa else DUEL["heal_start"]
+        heal_until = DUEL["ffa_heal_until"] if ffa else DUEL["heal_until"]
+        if quiet and hpf < heal_start:
             self.healing = True
         heal_block = [m for m in enemies if not DUEL["heal_ignore_wanderers"]
                       or self.is_hunting(m, x, y, hyp(x, y, m["pos"][0], m["pos"][1]), 1.0, t)]
         if DUEL["heal_ignore_wanderers"] and quiet is False and not heal_block and t - self.last_damage_t > 3.0 \
                 and hpf < DUEL["heal_start"]:
             self.healing = True
-        if hpf >= DUEL["heal_until"] or (heal_block and hpf >= 0.5):
+        if hpf >= heal_until or (heal_block and hpf >= 0.5 and not ffa):
             self.healing = False
 
         # ---- zone timing
@@ -666,12 +752,24 @@ class Duelist(base.Bot):
                 for m in enemies:
                     if int(m["id"]) == self.focus_id:
                         fr = (m.get("hp") or 1400.0) / max(1.0, m.get("max_hp") or 1400.0)
-                        if fr + DUEL["chase_margin"] < hpf and hyp(x, y, m["pos"][0], m["pos"][1]) < DUEL["chase_range"]:
+                        ok = fr + DUEL["chase_margin"] < hpf and hyp(x, y, m["pos"][0], m["pos"][1]) < DUEL["chase_range"]
+                        if cautious:
+                            ok = ok and fr < DUEL["ffa_weak_frac"]  # only run down a nearly dead mech
+                        if ok:
                             chase = m
                         break
+            seen_by = [m for (m, dm) in shooters if dm < DUEL["ffa_hide_m"]]
+            clear = not any(hyp(x, y, m["pos"][0], m["pos"][1]) < DUEL["farm_clear_m"] for m in enemies)
             if chase is not None:
                 goal, mode = (chase["pos"][0], chase["pos"][1]), "chase"
                 target = chase
+            elif cautious and seen_by and W is not None:
+                # a mech can see us and we are not fighting it: break line of sight before anything else
+                mode = "hide"
+                if self.cover is None or t - self.cover_t > 1.0:
+                    self.choose_cover(obs, x, y, z, threats, t)
+                if self.cover is not None and hyp(x, y, *self.cover) > 2.0:
+                    goal = self.cover
             else:
                 econ = None
                 # a supply drop is +3 cubes and a full heal, so it is not gated on HP
@@ -679,25 +777,19 @@ class Duelist(base.Bot):
                 if dg is not None:
                     econ = (dg, "drop")
                 elif hpf >= 0.4 and t < self.T["final_center_t"]:
-                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8,
-                                          wmax=(DUEL["opening_arm_m"] if self.opening else None))
+                    wmax = DUEL["opening_arm_m"] if self.opening else (DUEL["ffa_arm_m"] if ffa else None)
+                    econ = self.econ_goal(obs, me, x, y, z, t, act, zone_urgent and zdist > 8, wmax=wmax)
                 if econ is not None:
                     goal, mode = econ
-                elif self.opening:
-                    # nothing worth a short trip: stay out of sight of any mech we can see, else hold still
-                    mode = "open-hold"
-                    if enemies and W is not None:
-                        if self.cover is None or t - self.cover_t > 1.0:
-                            self.choose_cover(obs, x, y, z, threats, t)
-                        if self.cover is not None and hyp(x, y, *self.cover) > 2.0:
-                            goal, mode = self.cover, "open-hide"
                 else:
-                    fg = None
-                    if hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk:
-                        fg = self.farm_seek(obs, x, y, z)
-                    eg = None
-                    if fg is None and DUEL["explore"] and hpf >= 0.5 and t < self.endgame_t and not zone_urgent:
-                        eg = self.explore_goal(obs, x, y, t, my_id)
+                    farm_ok = hpf >= DUEL["farm_hp"] and t < self.endgame_t and need_speed < 0.4 * self.walk
+                    explore_ok = DUEL["explore"] and hpf >= 0.5 and t < self.endgame_t and not zone_urgent
+                    if cautious:
+                        # farming and exploring only with nobody near, and (free-for-all) only early
+                        quiet_farm = clear and (not ffa or t < DUEL["ffa_farm_stop"])
+                        farm_ok, explore_ok = farm_ok and quiet_farm, explore_ok and quiet_farm
+                    fg = self.farm_seek(obs, x, y, z) if farm_ok else None
+                    eg = self.explore_goal(obs, x, y, t, my_id) if (fg is None and explore_ok) else None
                     if fg is not None:
                         goal, mode = fg, "farm-seek"
                     elif eg is not None:
@@ -797,7 +889,14 @@ class Duelist(base.Bot):
         fire = [False, False]
         aim = None
         shoot_at = target
-        if shoot_at is None and hpf >= DUEL["farm_hp"] and t < self.endgame_t and not enemies and not self.opening:
+        farm_fire = hpf >= DUEL["farm_hp"] and t < self.endgame_t
+        if cautious:
+            # gunfire carries 320 m: farm only with no known mech near and no recent damage
+            farm_fire = farm_fire and t - self.last_damage_t > 8.0 and (not ffa or t < DUEL["ffa_farm_stop"]) and \
+                not any(hyp(x, y, m["pos"][0], m["pos"][1]) < DUEL["farm_clear_m"] for m in enemies)
+        else:
+            farm_fire = farm_fire and not enemies
+        if shoot_at is None and farm_fire:
             shoot_at = self.farm_target(obs, x, y, z, muz_h)
         if shoot_at is None:
             # drones shooting us
