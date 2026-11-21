@@ -86,6 +86,17 @@ PARAMS = {
     "ffa_ev_needed": 1,
     # evidence before ffa_min_t s is ignored (cuts squad false switches; FFA replays: 75% still detected by 20 s)
     "ffa_min_t": 8.0,
+    # free-for-all only: a seen mech is "hostile nearby" (no farming for 12 s) inside ffa_hostile_m, we
+    # walk to cover when one is inside ffa_hide_m, and ffa_farm_fast walks to crates/drones at full speed
+    "ffa_hostile_m": 230.0,
+    "ffa_hide_m": 200.0,
+    "ffa_farm_fast": False,
+    # free-for-all only: stand at most ffa_zone_depth x radius from the next circle centre (0 = old: 30 m
+    # inside its edge), and with ffa_rotate_early walk there as soon as the circle is known instead of
+    # waiting until the shrink forces it (top-16 bots: 87% already inside when a shrink starts, depth 0.66)
+    "ffa_zone_depth": 0.0,
+    "ffa_rotate_early": False,
+    "ffa_zone_lead_s": 15.0,
     # v5 loot: a pickup more than loot_roof_dz above the terrain under it is on a roof; before
     # loot_early_t (first hunters arrive) weapon pickups are sought up to loot_early_range.
     "loot_roof_dz": 2.0,
@@ -508,7 +519,7 @@ class Bot:
         npcs = [m for m in obs.get("mechs") or [] if m.get("kind") == "npc"]
         for m in enemies:
             dm = hyp(x, y, m["pos"][0], m["pos"][1])
-            if dm < 230:
+            if dm < (PARAMS["ffa_hostile_m"] if self.ffa else 230):
                 self.last_hostile_t = t
         enemies.sort(key=lambda m: hyp(x, y, m["pos"][0], m["pos"][1]))
         threats: List[Tuple[float, float, float, float]] = []  # x, y, z, weight
@@ -626,7 +637,18 @@ class Bot:
         time_left = max(1.0, min(zone["shrink_end"], edge_t) - t - PARAMS["zone_slack_s"])
         need_speed = plen / time_left
         silent = 0.42 * self.walk  # < 5 m/s: no step sounds
-        urgent = out_now or need_speed > 0.75 * silent or (zone["shrink_start"] - t < 15 and zdist > 5)
+        lead_s = PARAMS["ffa_zone_lead_s"] if self.ffa else 15
+        urgent = out_now or need_speed > 0.75 * silent or (zone["shrink_start"] - t < lead_s and zdist > 5)
+        # (2) quiet pre-rotation: a point ffa_zone_depth x radius from the next centre, walked to only when
+        # nothing else is going on (no fight, loot, hiding or farming)
+        deep_goal = None
+        if self.ffa and PARAMS["ffa_rotate_early"] and PARAMS["ffa_zone_depth"] > 0 \
+                and t < min(self.endgame_t, self.T["final_center_t"]):
+            ncx_, ncy_ = zone["next_center"]
+            lim_ = PARAMS["ffa_zone_depth"] * zone["next_radius"]
+            dd_ = hyp(ncx_, ncy_, x, y)
+            if dd_ > lim_ + 10.0:
+                deep_goal = (ncx_ + (x - ncx_) * lim_ / dd_, ncy_ + (y - ncy_) * lim_ / dd_)
 
         speed = PARAMS["silent_move"]  # silent walk
         goal: Optional[Tuple[float, float]] = None
@@ -647,7 +669,7 @@ class Bot:
                     if fr < hp / mhp and hyp(x, y, m["pos"][0], m["pos"][1]) < PARAMS["chase_range"]:
                         chase = m
                     break
-        hide_needed = (not fighting) and (chase is None) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 200)
+        hide_needed = (not fighting) and (chase is None) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < (PARAMS["ffa_hide_m"] if self.ffa else 200))
                                           or (hp < mhp * 0.98 and recent_hostile))
         if W and threats and hide_needed and elapsed < 6:
             if t - self.cover_t > 0.5 or self.cover is None:
@@ -723,7 +745,11 @@ class Bot:
             elif fg is not None:
                 goal = fg
                 mode = "farm-seek"
-                speed = PARAMS["silent_move"]
+                speed = 1.0 if (self.ffa and PARAMS["ffa_farm_fast"]) else PARAMS["silent_move"]
+            elif deep_goal is not None:
+                goal = deep_goal
+                mode = "rotate"
+                speed = PARAMS["silent_move"] if (zone["shrink_start"] - t) * silent > 1.4 * hyp(x, y, *deep_goal) else 1.0
             elif (not self.ffa and self.hunter_c is not None and t - self.hunter_c[2] < 30.0
                   and self.inner_edge_t <= t < self.T["final_center_t"] and not urgent
                   and hyp(self.hunter_c[0], self.hunter_c[1], *zone["next_center"]) > zone["next_radius"]):
