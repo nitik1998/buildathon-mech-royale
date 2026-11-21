@@ -26,6 +26,9 @@ base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
 # Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
 # 130 m, inside a drone's 1.8 m radius), and walk toward ones seen within 170 m.
 base.PARAMS.update({"farm_range": 130.0, "farm_seek_range": 170.0})
+# Free-for-all switch: one "a mech lost HP and it was not us" event also happens in practice (drones,
+# splash), and the squad simulator flipped 5 of 48 practice matches into hiding on it. Ask for three.
+base.PARAMS["ffa_ev_needed"] = 3
 FARM_STAND_DRONE = 55.0   # m: outside the drone's 45 m aggro range, close enough for accurate fire
 FARM_STAND_CRATE = 12.0
 
@@ -69,6 +72,9 @@ DUEL = {
     "hunt_close_m": 60.0,
     "hunt_closing_mps": 3.0,
     "hunt_low_frac": 0.3,
+    # last stand: when we would retreat but this many enemies are already within 150 m, retreating rarely
+    # saves us (we die with our back turned); fight the weakest instead (99 = off)
+    "last_stand_n": 99,
 }
 
 PARAMS = DUEL  # simulator overrides ("bot+key=value") land here
@@ -293,6 +299,15 @@ class Duelist(base.Bot):
             and n_threat <= 2
         if finishing:
             retreat = False
+        if retreat and target is not None:
+            near150 = sum(1 for m in enemies if hyp(x, y, m["pos"][0], m["pos"][1]) < 150)
+            if near150 >= DUEL["last_stand_n"]:
+                retreat = False
+                weak = [m for m in enemies if hyp(x, y, m["pos"][0], m["pos"][1]) < 150 and not (
+                    W and W.sight_blocked((x, y, z + muz_h), (m["pos"][0], m["pos"][1], m["pos"][2] + 4.0)))]
+                if weak:
+                    target = min(weak, key=lambda m: m.get("hp") or 1400.0)
+                    tfrac = (target.get("hp") or 1400.0) / max(1.0, target.get("max_hp") or 1400.0)
 
         # ---- heal after fights (regen 45 HP/s starts 5 s after the last damage dealt or taken)
         quiet = not enemies and t - self.last_damage_t > 3.0
