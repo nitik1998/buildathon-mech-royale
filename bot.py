@@ -27,7 +27,7 @@ base.WEAPON_RANK.update({"laser": 3, "lightning": 2, "mortar": 1, "gun": 0})
 # holding a mortar takes +60% from lasers (cook-off). Rank it below an empty slot so we never take it,
 # and drop one if we are holding it (frees the slot for a laser or lightning).
 NO_MORTAR = True
-RNG_SALT = 0
+RNG_SALT = 4
 if NO_MORTAR:
     base.WEAPON_RANK["mortar"] = -1
 # Farm from farther: shoot drones and crates in sight out to 130 m (gun spread 0.6 deg is ~1.4 m at
