@@ -86,6 +86,26 @@ PARAMS = {
     "ffa_ev_needed": 1,
     # evidence before ffa_min_t s is ignored (cuts squad false switches; FFA replays: 75% still detected by 20 s)
     "ffa_min_t": 8.0,
+    "cover_max_cands": 0,
+    "cover_budget_s": 0.005,
+    "astar_nodes": 600,
+    "astar_budget_s": 0.007,
+    "ffa_cube_cap": 0,
+    "ffa_drops": False,
+    "ffa_drop_m": 150.0,
+    "ffa_home": False,
+    "ffa_home_every_s": 8.0,
+    # free-for-all only: a seen mech is "hostile nearby" (no farming for 12 s) inside ffa_hostile_m, we
+    # walk to cover when one is inside ffa_hide_m, and ffa_farm_fast walks to crates/drones at full speed
+    "ffa_hostile_m": 230.0,
+    "ffa_hide_m": 200.0,
+    "ffa_farm_fast": False,
+    # free-for-all only: stand at most ffa_zone_depth x radius from the next circle centre (0 = old: 30 m
+    # inside its edge), and with ffa_rotate_early walk there as soon as the circle is known instead of
+    # waiting until the shrink forces it (top-16 bots: 87% already inside when a shrink starts, depth 0.66)
+    "ffa_zone_depth": 0.0,
+    "ffa_rotate_early": False,
+    "ffa_zone_lead_s": 15.0,
     # v5 loot: a pickup more than loot_roof_dz above the terrain under it is on a roof; before
     # loot_early_t (first hunters arrive) weapon pickups are sought up to loot_early_range.
     "loot_roof_dz": 2.0,
@@ -318,7 +338,7 @@ class Bot:
         self.mode = "start"
         self.slow_ticks = 0
         self.tick_t0 = 0.0
-        self.cover_budget_s = 0.005
+        self.cover_budget_s = PARAMS["cover_budget_s"]
         # v3: focus fire. The mech we damaged last and when; we finish it instead of letting it regen.
         self.focus_id: Optional[int] = None
         self.focus_t = -99.0
@@ -508,7 +528,7 @@ class Bot:
         npcs = [m for m in obs.get("mechs") or [] if m.get("kind") == "npc"]
         for m in enemies:
             dm = hyp(x, y, m["pos"][0], m["pos"][1])
-            if dm < 230:
+            if dm < (PARAMS["ffa_hostile_m"] if self.ffa else 230):
                 self.last_hostile_t = t
         enemies.sort(key=lambda m: hyp(x, y, m["pos"][0], m["pos"][1]))
         threats: List[Tuple[float, float, float, float]] = []  # x, y, z, weight
@@ -626,7 +646,36 @@ class Bot:
         time_left = max(1.0, min(zone["shrink_end"], edge_t) - t - PARAMS["zone_slack_s"])
         need_speed = plen / time_left
         silent = 0.42 * self.walk  # < 5 m/s: no step sounds
-        urgent = out_now or need_speed > 0.75 * silent or (zone["shrink_start"] - t < 15 and zdist > 5)
+        lead_s = PARAMS["ffa_zone_lead_s"] if self.ffa else 15
+        urgent = out_now or need_speed > 0.75 * silent or (zone["shrink_start"] - t < lead_s and zdist > 5)
+        # (2) quiet pre-rotation: a point ffa_zone_depth x radius from the next centre, walked to only when
+        # nothing else is going on (no fight, loot, hiding or farming)
+        home = self.home_spot(obs, x, y, z, t) if (self.ffa and PARAMS["ffa_home"] and W) else None
+        fdrop = None
+        if self.ffa and PARAMS["ffa_drops"] and not out_now:
+            for dd0 in obs.get("drops") or []:
+                try:
+                    dpx, dpy = dd0["pos"][0], dd0["pos"][1]
+                except Exception:
+                    continue
+                ddist = hyp(x, y, dpx, dpy)
+                dlands = dd0.get("lands_in") or 0.0
+                if ddist > PARAMS["ffa_drop_m"] or dlands > ddist / max(1.0, self.walk) + 6.0:
+                    continue
+                if self.safe_point(obs, dpx, dpy, t + max(dlands, 0.0) + 5.0) >= 1:
+                    continue
+                if ddist > 12.0 and any(hyp(m["pos"][0], m["pos"][1], dpx, dpy) < 70.0 for m in enemies):
+                    continue  # someone is at it already
+                if fdrop is None or ddist < fdrop[2]:
+                    fdrop = (dpx, dpy, ddist)
+        deep_goal = None
+        if self.ffa and PARAMS["ffa_rotate_early"] and PARAMS["ffa_zone_depth"] > 0 \
+                and t < min(self.endgame_t, self.T["final_center_t"]):
+            ncx_, ncy_ = zone["next_center"]
+            lim_ = PARAMS["ffa_zone_depth"] * zone["next_radius"]
+            dd_ = hyp(ncx_, ncy_, x, y)
+            if dd_ > lim_ + 10.0:
+                deep_goal = (ncx_ + (x - ncx_) * lim_ / dd_, ncy_ + (y - ncy_) * lim_ / dd_)
 
         speed = PARAMS["silent_move"]  # silent walk
         goal: Optional[Tuple[float, float]] = None
@@ -647,7 +696,7 @@ class Bot:
                     if fr < hp / mhp and hyp(x, y, m["pos"][0], m["pos"][1]) < PARAMS["chase_range"]:
                         chase = m
                     break
-        hide_needed = (not fighting) and (chase is None) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < 200)
+        hide_needed = (not fighting) and (chase is None) and (engaged or (enemies and hyp(x, y, enemies[0]["pos"][0], enemies[0]["pos"][1]) < (PARAMS["ffa_hide_m"] if self.ffa else 200))
                                           or (hp < mhp * 0.98 and recent_hostile))
         if W and threats and hide_needed and elapsed < 6:
             if t - self.cover_t > 0.5 or self.cover is None:
@@ -662,7 +711,16 @@ class Bot:
         under_fire = (t - self.last_dmg_anon_t) < 4.0 or any(t - ta < 4.0 for ta in self.attackers.values())
         econ_hp = hp >= PARAMS["econ_min_hp"] * mhp or (self.corpse is not None and hp >= PARAMS["retreat_hp"] * mhp)
         if not fighting and chase is None and not out_now and econ_hp and t < self.T["final_center_t"]:
-            econ = self.econ_goal(obs, me, x, y, z, t, act, urgent and zdist > 8)
+            ffa_capped = self.ffa and PARAMS["ffa_cube_cap"] > 0 and (me.get("cubes", 0) or 0) >= PARAMS["ffa_cube_cap"]
+            if ffa_capped and any(k in ("laser", "lightning") for k in my_kinds):
+                self.corpse = None
+            cr_keep = PARAMS["cube_range"]
+            if ffa_capped:
+                PARAMS["cube_range"] = 0.0
+            try:
+                econ = self.econ_goal(obs, me, x, y, z, t, act, urgent and zdist > 8)
+            finally:
+                PARAMS["cube_range"] = cr_keep
             # with shooters on us, take the trip only when they need several times longer to kill us
             # than the trip takes (a far gunner landing few hits)
             if econ is not None and (shooters or under_fire):
@@ -700,6 +758,12 @@ class Bot:
             goal = (chase["pos"][0], chase["pos"][1])
             mode = "chase"
             speed = 1.0
+        elif fdrop is not None and (fdrop[2] < 12.0 or not (engaged and hp < 0.5 * mhp)):
+            if fdrop[2] > 3.5:
+                goal, mode, speed = (fdrop[0], fdrop[1]), "drop", 1.0
+            else:
+                goal = (fdrop[0] + 2.5 * math.cos(1.6 * t), fdrop[1] + 2.5 * math.sin(1.6 * t))
+                mode, speed = "drop-hold", 0.7
         elif econ is not None:
             goal, mode = econ
             speed = 1.0 if (enemies or t < self.arm_t or mode == "corpse") else PARAMS["silent_move"]
@@ -715,7 +779,9 @@ class Bot:
             fg = None
             if lg is None and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp and t < self.endgame_t \
                     and need_speed < 0.5 * silent:
-                fg = self.farm_seek(obs, x, y, z)
+                if not (self.ffa and PARAMS["ffa_cube_cap"] > 0 and (me.get("cubes", 0) or 0) >= PARAMS["ffa_cube_cap"]
+                        and any(k in ("laser", "lightning") for k in my_kinds)):
+                    fg = self.farm_seek(obs, x, y, z)
             if lg is not None:
                 goal = lg
                 mode = "loot"
@@ -723,7 +789,18 @@ class Bot:
             elif fg is not None:
                 goal = fg
                 mode = "farm-seek"
-                speed = PARAMS["silent_move"]
+                speed = 1.0 if (self.ffa and PARAMS["ffa_farm_fast"]) else PARAMS["silent_move"]
+            elif home is not None and not urgent:
+                if hyp(x, y, home[0], home[1]) > 3.0:
+                    goal = home
+                    mode = "home"
+                    speed = PARAMS["silent_move"] if need_speed < 0.8 * silent else 1.0
+                else:
+                    mode = "camp"
+            elif deep_goal is not None:
+                goal = deep_goal
+                mode = "rotate"
+                speed = PARAMS["silent_move"] if (zone["shrink_start"] - t) * silent > 1.4 * hyp(x, y, *deep_goal) else 1.0
             elif (not self.ffa and self.hunter_c is not None and t - self.hunter_c[2] < 30.0
                   and self.inner_edge_t <= t < self.T["final_center_t"] and not urgent
                   and hyp(self.hunter_c[0], self.hunter_c[1], *zone["next_center"]) > zone["next_radius"]):
@@ -847,7 +924,9 @@ class Bot:
         fire = [False, False]
         weapons = me.get("weapons") or [None, None]
         aim = None
-        if target is None and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp and t < self.endgame_t:
+        if target is None and not recent_hostile and hp >= PARAMS["farm_min_hp"] * mhp and t < self.endgame_t \
+                and not (self.ffa and PARAMS["ffa_cube_cap"] > 0 and (me.get("cubes", 0) or 0) >= PARAMS["ffa_cube_cap"]
+                         and any(k in ("laser", "lightning") for k in my_kinds)):
             target = self.farm_target(obs, x, y, z, muz_h)
             if target is not None:
                 mode += "+farm"  # I3: the label is the movement mode; fire targets are a suffix
@@ -1298,6 +1377,8 @@ class Bot:
             a = away + a0 + rot
             for f in (0.25, 0.5, 0.75, 1.0):
                 cands.append((x + radius * f * math.cos(a), y + radius * f * math.sin(a)))
+        if PARAMS["cover_max_cands"] > 0:
+            cands = cands[:PARAMS["cover_max_cands"]]
         ths = sorted(threats, key=lambda th: hyp(x, y, th[0], th[1]) / th[3])[:3]
         deadline = self.tick_t0 + self.cover_budget_s
         for (px, py) in cands:
@@ -1338,6 +1419,91 @@ class Bot:
                 return
         self.cover, self.cover_score, self.cover_t = best, bs, t
 
+    def expo_at(self, px: float, py: float) -> Optional[float]:
+        """How visible is a mech standing here? The weighted share of places another mech could stand (12
+        bearings x 60 / 120 / 200 m, nearer ones count more) with a clear line of sight to it. Measured once
+        per 8 m cell and kept; at most expo_budget new cells per decision (None = not measured yet)."""
+        W = self.world
+        key = (int(px // 8), int(py // 8))
+        cache = self.__dict__.setdefault("expo_cache", {})
+        v = cache.get(key)
+        if v is not None:
+            return v
+        if self.__dict__.get("expo_budget", 0) <= 0:
+            return None
+        self.expo_budget -= 1
+        cx, cy = key[0] * 8 + 4.0, key[1] * 8 + 4.0
+        gz = W.floor[W.idx(cx, cy)]
+        seen = tot = 0.0
+        for k in range(12):
+            a = k * TAU / 12
+            ca, sa = math.cos(a), math.sin(a)
+            for d, w in ((60.0, 1.5), (120.0, 1.0), (200.0, 0.6)):
+                bx, by = cx + d * ca, cy + d * sa
+                if not W.walkable(bx, by):
+                    continue
+                tot += w
+                eye = (bx, by, W.floor[W.idx(bx, by)] + 8.0)
+                if not (W.sight_blocked(eye, (cx, cy, gz + 4.5)) and W.sight_blocked(eye, (cx, cy, gz + 8.5))):
+                    seen += w
+        v = seen / tot if tot > 0 else 0.0
+        cache[key] = v
+        return v
+
+    def home_spot(self, obs, x: float, y: float, z: float, t: float) -> Optional[Tuple[float, float]]:
+        """Free-for-all camp spot: the least visible place on our level inside the next circle within about
+        110 m, away from mechs we know of. Re-picked every ffa_home_every_s; a new spot must be clearly
+        better. In the top-16 showdowns exposure before the first fight decides the first minute: the least
+        seen quarter of mechs averaged 9.2 points, the most seen quarter 5.6."""
+        W = self.world
+        zn = obs["zone"]
+        ncx, ncy = zn["next_center"]
+        nr = zn["next_radius"]
+        inset = max(0.0, nr - min(30.0, 0.35 * nr + 3.0))
+        d = self.__dict__
+        home = d.get("home")
+        if home is not None and (hyp(ncx, ncy, home[0], home[1]) > inset or t < d.get("home_bad_until", -1.0)):
+            home = d["home"] = None
+        if home is not None and t - d.get("home_t", -99.0) < PARAMS["ffa_home_every_s"]:
+            return home
+        self.expo_budget = 25
+        known = self.known_mechs(t, (obs.get("self") or {}).get("id"))
+        bad = d.setdefault("home_bad", {})
+        gx, gy = 12.0 * round(x / 12.0), 12.0 * round(y / 12.0)
+        best, bs, cur_s, missing = None, 1e9, None, False
+        offs = sorted(((i, j) for i in range(-9, 10) for j in range(-9, 10)), key=lambda q: q[0] * q[0] + q[1] * q[1])
+        for (i, j) in offs:
+            px, py = gx + 12.0 * i, gy + 12.0 * j
+            if hyp(ncx, ncy, px, py) > inset or not W.walkable(px, py):
+                continue
+            if abs(W.floor[W.idx(px, py)] - z) > 4.0 or bad.get((int(px // 8), int(py // 8)), -1.0) > t:
+                continue
+            e = self.expo_at(px, py)
+            if e is None:
+                missing = True
+                continue
+            sc = 120.0 * e + 0.25 * hyp(x, y, px, py) + 40.0 * sum(1 for (kx, ky) in known if hyp(kx, ky, px, py) < 80.0)
+            sc += self.safe_point(obs, px, py, t)
+            if sc < bs:
+                bs, best = sc, (px, py)
+        if home is not None:
+            e = self.expo_at(home[0], home[1])
+            if e is not None:
+                cur_s = 120.0 * e + 0.25 * hyp(x, y, home[0], home[1]) + 40.0 * sum(
+                    1 for (kx, ky) in known if hyp(kx, ky, home[0], home[1]) < 80.0) + self.safe_point(obs, home[0], home[1], t)
+        if best is not None and (home is None or cur_s is None or bs < cur_s - 15.0):
+            home = d["home"] = best
+            d["home_set_t"], d["home_d0"] = t, hyp(x, y, best[0], best[1])
+        # a spot we cannot get closer to (walled courtyard, ledge) is dropped and avoided for a minute
+        if home is not None and t - d.get("home_set_t", t) > 8.0:
+            if hyp(x, y, home[0], home[1]) > 6.0 and hyp(x, y, home[0], home[1]) > d.get("home_d0", 0.0) - 6.0:
+                bad[(int(home[0] // 8), int(home[1] // 8))] = t + 60.0
+                d["home_bad_until"] = t + 0.2
+            else:
+                d["home_set_t"], d["home_d0"] = t, hyp(x, y, home[0], home[1])
+        d["home_t"] = t - (PARAMS["ffa_home_every_s"] - 1.5 if missing else 0.0)
+        return home
+
     # ------------------------------------------------------------------ steering
     def steer(self, x: float, y: float, goal: Tuple[float, float], t: float, me) -> List[float]:
         W = self.world
@@ -1358,7 +1524,7 @@ class Bot:
             self.plan_goal = (gx, gy)
             self.plan_t = t
         if self.planner is not None:
-            if self.planner.step(600, self.tick_t0 + 0.007):
+            if self.planner.step(PARAMS["astar_nodes"], self.tick_t0 + PARAMS["astar_budget_s"]):
                 if self.planner.path:
                     self.path = self.planner.path
                     self.path_i = 0
