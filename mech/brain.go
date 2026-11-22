@@ -169,6 +169,8 @@ func NewBrain(h *Hello, w *World) *Brain {
 	if seed == 0 {
 		seed = int64(h.Slot) + 1
 	}
+	seed += 1000003 * slotSalt[h.Slot] // Hackermen: per-slot random stream (slot_salt.go)
+	hmSeed0 = seed
 	return &Brain{
 		W: w, Cfg: h.Config, Slot: h.Slot, rng: rand.New(rand.NewSource(seed)), P: DefaultParams(),
 		tracks: map[int]*Track{}, npcs: map[int]*Track{}, crates: map[int]*known{}, cubes: map[int]*known{},
@@ -497,6 +499,7 @@ func (b *Brain) step(o *Obs, act *Action) {
 	b.now = o.T
 	now := o.T
 	b.observe(o)
+	b.hmReseed() // Hackermen: per-slot late re-roll (slot_salt.go)
 	st := &me.Stats
 	x, y, zf := me.Pos[0], me.Pos[1], me.Pos[2]
 	z := &o.Zone
